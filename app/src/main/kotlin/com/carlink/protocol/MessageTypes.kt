@@ -329,6 +329,27 @@ enum class AudioCommand(
 }
 
 /**
+ * Stream purpose for audio routing and AudioFocus management.
+ *
+ * Derived from AudioCommand packets (SIRI_START, PHONECALL_START, etc.)
+ * to create per-purpose AudioTracks with correct AudioAttributes/USAGE,
+ * enabling AAOS to route streams to the correct audio zones.
+ */
+enum class StreamPurpose {
+    MEDIA,       // Music, podcasts (default)
+    PHONE_CALL,  // Active phone call
+    SIRI,        // Voice assistant
+    ALERT,       // System alerts/notifications
+    RINGTONE,    // Incoming call ring
+    NAVIGATION,  // Turn-by-turn (has own track, included for completeness)
+    ;
+
+    companion object {
+        val DEFAULT = MEDIA
+    }
+}
+
+/**
  * File addresses for adapter configuration files.
  */
 enum class FileAddress(

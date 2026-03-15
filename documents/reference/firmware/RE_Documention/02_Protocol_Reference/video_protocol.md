@@ -1212,6 +1212,38 @@ Given the host display dimensions (`srcWidth` × `srcHeight`), four tiers are ge
 
 Default tier selection: **720p** (index 1). User-configurable via preference `vandroidautoh` (480/720/1080/1440).
 
+### 1440p / 2160p: Not Supported by Android Auto (Verified 2026-03-12)
+
+**Device:** Pixel 10 (frankel), Android 16 (API 36), security patch 2026-02-05
+**AA Version:** v16.3.660834-release (com.google.android.projection.gearhead)
+
+Although the AutoKit manufacturer app defines 4 tiers (including 1440p) and the Android Auto APK contains enum values for `VIDEO_2560x1440`, `VIDEO_1440x2560`, `VIDEO_3840x2160`, and `VIDEO_2160x3840` (class `wvc`, ordinals 3/4/7/8), **the actual resolution mapping function (`gvu.p()`) throws `iuz("Unsupported resolution")` for any resolution above 1080p.**
+
+Verified by JADX decompilation of `base.apk` pulled from Pixel 10:
+
+```java
+// gvu.p() — the only function that maps wvc enum → Size for video negotiation
+static final Size p(wvc wvcVar) throws iuz {
+    int iOrdinal = wvcVar.ordinal();
+    if (iOrdinal == 0) return new Size(800, 480);    // VIDEO_800x480
+    if (iOrdinal == 1) return new Size(1280, 720);   // VIDEO_1280x720
+    if (iOrdinal == 2) return new Size(1920, 1080);  // VIDEO_1920x1080
+    if (iOrdinal == 5) return new Size(720, 1280);   // VIDEO_720x1280 (portrait)
+    if (iOrdinal == 6) return new Size(1080, 1920);  // VIDEO_1080x1920 (portrait)
+    throw new iuz("Unsupported resolution: " + wvcVar.name());
+}
+```
+
+This function is called by `gvu.n()` → `wcs.b()` during video size negotiation. Selecting "1440p" or "2160p" in AA Developer Settings (`car_video_resolution`) will cause a runtime exception.
+
+**Additional constraints from AA APK analysis:**
+- **Framerate:** 480p and 720p get **60fps**; 1080p gets **30fps** (determined by `vbu.aj()` — ordinals 0,1 → 60fps, else → 30fps)
+- **Codecs supported:** H.264 Baseline Profile, H.265, AV1 (class `idx`, field `h`)
+- **Wireless restriction:** Resolution may be further limited by Wi-Fi frequency band (5GHz required for wireless AA; log: `"VideoCodecResolutionType %s (%d) is not allowed due wireless frequency"`)
+- **Manufacturer blocklist:** Subaru and HARMAN head units have a separate resolution restriction path (class `idx`, field `b`)
+
+**Conclusion:** The effective maximum AA resolution is **1920×1080 @ 30fps** (landscape) or **1080×1920 @ 30fps** (portrait). The 1440p/2160p enum values and dev settings entries are forward-looking placeholders with no functional implementation as of AA v16.3.
+
 **Example for GM gminfo37 (2400×960):**
 - 720p tier: width = `(720 * 2400/960) & 0xFFFE` = `1800 & 0xFFFE` = **1800**, height = **720**
 - Capped at max: width = min(1800, 1280) = **1280**, height = **720**

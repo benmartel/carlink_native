@@ -442,6 +442,17 @@ object MessageSerializer {
             messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
         }
 
+        // Audio transfer mode: runtime state not persisted by adapter, must re-send every session.
+        // cmd=23 (UseBoxTransAudio) enables USB mic → SCO bridge required for AA phone call mic.
+        // Without this, AA phone calls have no mic uplink (adapter reads from non-existent ALSA PCM).
+        val audioTransferCommand =
+            if (config.audioTransferMode) {
+                CommandMapping.AUDIO_TRANSFER_ON
+            } else {
+                CommandMapping.AUDIO_TRANSFER_OFF
+            }
+        messages.add(serializeCommand(audioTransferCommand))
+
         when (initMode) {
             "MINIMAL_ONLY" -> {
                 // Just minimal - adapter retains all other settings
@@ -578,14 +589,7 @@ object MessageSerializer {
         val micCommand = if (config.micType == "box") CommandMapping.BOX_MIC else CommandMapping.MIC
         messages.add(serializeCommand(micCommand))
 
-        // Audio transfer mode
-        val audioTransferCommand =
-            if (config.audioTransferMode) {
-                CommandMapping.AUDIO_TRANSFER_ON
-            } else {
-                CommandMapping.AUDIO_TRANSFER_OFF
-            }
-        messages.add(serializeCommand(audioTransferCommand))
+        // Audio transfer mode: now in minimal init (always-sent), not here
 
         // Android work mode (if enabled)
         if (config.androidWorkMode) {

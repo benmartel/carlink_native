@@ -39,6 +39,7 @@ import com.carlink.protocol.PhoneType
 import com.carlink.protocol.PluggedMessage
 import com.carlink.protocol.SessionTokenMessage
 import com.carlink.protocol.StatusValueMessage
+import com.carlink.protocol.StreamPurpose
 import com.carlink.protocol.UnknownMessage
 import com.carlink.protocol.UnpluggedMessage
 import com.carlink.protocol.VideoStreamingSignal
@@ -202,6 +203,7 @@ class CarlinkManager(
     private var isMicrophoneCapturing = false
     private var currentMicDecodeType = 5 // 16kHz mono
     private var currentMicAudioType = 3 // Siri/voice input
+    private var lastIncomingDecodeType = 5 // Track adapter's current audio format (from incoming AudioData)
     private var micSendTimer: Timer? = null
 
     /**
@@ -217,6 +219,9 @@ class CarlinkManager(
     private enum class VoiceMode { NONE, SIRI, PHONECALL }
 
     private var activeVoiceMode = VoiceMode.NONE
+
+    // Stream purpose tracking for per-purpose AudioTracks and AudioFocus
+    private var currentStreamPurpose = StreamPurpose.MEDIA
 
     // GNSS
     private var gnssForwarder: GnssForwarder? = null
@@ -486,6 +491,7 @@ class CarlinkManager(
         // Initialize audio manager with platform-specific config
         audioManager =
             DualStreamAudioManager(
+                context,
                 logCallback,
                 audioConfig,
             )
@@ -713,6 +719,7 @@ class CarlinkManager(
         callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         clearCachedMediaMetadata() // Clear stale metadata to prevent race conditions on reconnect
         activeVoiceMode = VoiceMode.NONE // Reset voice mode on disconnect
+        currentStreamPurpose = StreamPurpose.MEDIA // Reset purpose on disconnect
         stopMicrophoneCapture()
 
         // Stop GPS forwarding before stopping adapter (only if forwarder was created)
@@ -835,6 +842,7 @@ class CarlinkManager(
         currentPhoneType = null
         callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         activeVoiceMode = VoiceMode.NONE
+        currentStreamPurpose = StreamPurpose.MEDIA
         setState(State.DISCONNECTED)
     }
 
@@ -1378,7 +1386,7 @@ class CarlinkManager(
 
         // Handle audio commands for mic capture
         if (message is AudioDataMessage && message.command != null) {
-            handleAudioCommand(message.command)
+            handleAudioCommand(message.command, message.decodeType)
         }
     }
 
@@ -1395,6 +1403,9 @@ class CarlinkManager(
         // Skip if no audio data
         val audioData = message.data ?: return
 
+        // Track adapter's current audio decodeType (for mic format negotiation)
+        lastIncomingDecodeType = message.decodeType
+
         // Write audio with offset+length to avoid copy
         audioManager?.writeAudio(
             audioData,
@@ -1402,41 +1413,50 @@ class CarlinkManager(
             message.audioDataLength,
             message.audioType,
             message.decodeType,
+            currentStreamPurpose,
         )
     }
 
-    private fun handleAudioCommand(command: AudioCommand) {
-        logDebug("[AUDIO_CMD] Received audio command: ${command.name} (id=${command.id})", tag = Logger.Tags.AUDIO)
+    private fun handleAudioCommand(command: AudioCommand, messageDecodeType: Int = 5) {
+        logDebug(
+            "[AUDIO_CMD] ${command.name} (id=${command.id} purpose=$currentStreamPurpose)",
+            tag = Logger.Tags.AUDIO,
+        )
 
         when (command) {
             AudioCommand.AUDIO_NAVI_START -> {
                 logInfo("[AUDIO_CMD] Navigation audio START command received", tag = Logger.Tags.AUDIO)
-                // Nav audio data will start arriving - track is created on first packet
+                // Reset navStopped so writeAudio() accepts packets (NAVI_COMPLETE may never arrive)
+                audioManager?.onNavStarted()
+                // Nav track is created on first packet; nav focus is requested in ensureNavTrack()
             }
 
             AudioCommand.AUDIO_NAVI_STOP -> {
                 logInfo("[AUDIO_CMD] Navigation audio STOP command received", tag = Logger.Tags.AUDIO)
                 // Signal nav stopped - stop accepting new packets, but don't flush yet
-                // (NAVI_COMPLETE will handle final cleanup)
+                // (NAVI_COMPLETE will handle final cleanup including focus abandon)
                 audioManager?.onNavStopped()
             }
 
             AudioCommand.AUDIO_NAVI_COMPLETE -> {
                 logInfo("[AUDIO_CMD] Navigation audio COMPLETE command received", tag = Logger.Tags.AUDIO)
-                // Explicit end-of-prompt signal from adapter - clean shutdown
+                // Explicit end-of-prompt signal from adapter - clean shutdown + abandon nav focus
                 audioManager?.stopNavTrack()
             }
 
             AudioCommand.AUDIO_SIRI_START -> {
                 logInfo("[AUDIO_CMD] Siri started - enabling microphone (mode: SIRI)", tag = Logger.Tags.MIC)
                 activeVoiceMode = VoiceMode.SIRI
+                setPurpose(StreamPurpose.SIRI, command)
                 startMicrophoneCapture(decodeType = 5, audioType = 3)
             }
 
             AudioCommand.AUDIO_PHONECALL_START -> {
-                logInfo("[AUDIO_CMD] Phone call started - enabling microphone (mode: PHONECALL)", tag = Logger.Tags.MIC)
+                val micDecodeType = lastIncomingDecodeType
+                logInfo("[AUDIO_CMD] Phone call started - enabling microphone (mode: PHONECALL, decodeType=$micDecodeType)", tag = Logger.Tags.MIC)
                 activeVoiceMode = VoiceMode.PHONECALL
-                startMicrophoneCapture(decodeType = 5, audioType = 3)
+                setPurpose(StreamPurpose.PHONE_CALL, command)
+                startMicrophoneCapture(decodeType = micDecodeType, audioType = 3)
             }
 
             AudioCommand.AUDIO_SIRI_STOP -> {
@@ -1447,9 +1467,15 @@ class CarlinkManager(
                         "[AUDIO_CMD] Siri stopped but phone call active - keeping mic for call",
                         tag = Logger.Tags.MIC,
                     )
+                    logDebug(
+                        "[AUDIO_PURPOSE] SIRI_STOP ignored: phone call active, keeping PHONE_CALL",
+                        tag = Logger.Tags.AUDIO_DEBUG,
+                    )
+                    // Don't end SIRI purpose or revert — PHONE_CALL is active
                 } else {
                     logInfo("[AUDIO_CMD] Siri stopped - disabling microphone", tag = Logger.Tags.MIC)
                     activeVoiceMode = VoiceMode.NONE
+                    endPurpose(StreamPurpose.SIRI, command)
                     stopMicrophoneCapture()
                 }
             }
@@ -1457,23 +1483,28 @@ class CarlinkManager(
             AudioCommand.AUDIO_PHONECALL_STOP -> {
                 logInfo("[AUDIO_CMD] Phone call stopped - disabling microphone", tag = Logger.Tags.MIC)
                 activeVoiceMode = VoiceMode.NONE
+                endPurpose(StreamPurpose.PHONE_CALL, command)
                 stopMicrophoneCapture()
             }
 
             AudioCommand.AUDIO_MEDIA_START -> {
                 logDebug("[AUDIO_CMD] Media audio START command received", tag = Logger.Tags.AUDIO)
+                setPurpose(StreamPurpose.MEDIA, command)
             }
 
             AudioCommand.AUDIO_MEDIA_STOP -> {
                 logDebug("[AUDIO_CMD] Media audio STOP command received", tag = Logger.Tags.AUDIO)
+                endPurpose(StreamPurpose.MEDIA, command)
             }
 
             AudioCommand.AUDIO_ALERT_START -> {
                 logDebug("[AUDIO_CMD] Alert started", tag = Logger.Tags.AUDIO)
+                setPurpose(StreamPurpose.ALERT, command)
             }
 
             AudioCommand.AUDIO_ALERT_STOP -> {
                 logDebug("[AUDIO_CMD] Alert stopped", tag = Logger.Tags.AUDIO)
+                endPurpose(StreamPurpose.ALERT, command)
             }
 
             AudioCommand.AUDIO_OUTPUT_START -> {
@@ -1486,16 +1517,46 @@ class CarlinkManager(
 
             AudioCommand.AUDIO_INCOMING_CALL_INIT -> {
                 logInfo("[AUDIO_CMD] Incoming call ring (AudioCmd 14)", tag = Logger.Tags.AUDIO)
+                setPurpose(StreamPurpose.RINGTONE, command)
             }
 
             AudioCommand.AUDIO_INPUT_CONFIG -> {
-                logDebug("[AUDIO_CMD] Audio input configuration received", tag = Logger.Tags.AUDIO)
+                logDebug("[AUDIO_CMD] AUDIO_INPUT_CONFIG received (decodeType=$messageDecodeType)", tag = Logger.Tags.AUDIO)
+                lastIncomingDecodeType = messageDecodeType
+                // If mic is active, restart capture at the adapter's requested format
+                // (mirrors Autokit: case 3 → a.i = w.a → h.h(c(w.a, true)))
+                if (isMicrophoneCapturing && currentMicDecodeType != messageDecodeType) {
+                    logInfo("[AUDIO_CMD] INPUT_CONFIG: switching mic from decodeType=$currentMicDecodeType to $messageDecodeType", tag = Logger.Tags.MIC)
+                    stopMicrophoneCapture()
+                    startMicrophoneCapture(decodeType = messageDecodeType, audioType = currentMicAudioType)
+                }
             }
 
             AudioCommand.UNKNOWN -> {
                 logWarn("[AUDIO_CMD] Unknown audio command id=${command.id}", tag = Logger.Tags.AUDIO)
             }
         }
+    }
+
+    /** Set current stream purpose and request AudioFocus. */
+    private fun setPurpose(purpose: StreamPurpose, trigger: AudioCommand) {
+        val old = currentStreamPurpose
+        currentStreamPurpose = purpose
+        audioManager?.onPurposeChanged(purpose)
+        logDebug(
+            "[AUDIO_PURPOSE] $old → $purpose (trigger: ${trigger.name} voiceMode: $activeVoiceMode)",
+            tag = Logger.Tags.AUDIO_DEBUG,
+        )
+    }
+
+    /** End a stream purpose and abandon AudioFocus, reverting to MEDIA. */
+    private fun endPurpose(purpose: StreamPurpose, trigger: AudioCommand) {
+        currentStreamPurpose = StreamPurpose.MEDIA
+        audioManager?.onPurposeEnded(purpose)
+        logDebug(
+            "[AUDIO_PURPOSE] Ended $purpose (trigger: ${trigger.name})",
+            tag = Logger.Tags.AUDIO_DEBUG,
+        )
     }
 
     private fun startMicrophoneCapture(
@@ -1509,7 +1570,7 @@ class CarlinkManager(
             stopMicrophoneCapture()
         }
 
-        val started = microphoneManager?.start() ?: false
+        val started = microphoneManager?.start(decodeType) ?: false
         if (started) {
             isMicrophoneCapturing = true
             currentMicDecodeType = decodeType
@@ -1548,7 +1609,8 @@ class CarlinkManager(
     private fun sendMicrophoneData() {
         if (!isMicrophoneCapturing) return
 
-        val data = microphoneManager?.readChunk(maxBytes = 640) ?: return
+        val chunkSize = if (currentMicDecodeType == 3) 320 else 640 // 20ms at 8kHz or 16kHz mono
+        val data = microphoneManager?.readChunk(maxBytes = chunkSize) ?: return
         if (data.isNotEmpty()) {
             adapterDriver?.sendAudio(
                 data = data,
