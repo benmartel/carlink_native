@@ -1333,6 +1333,103 @@ Head unit touch → adapter → ADB (authenticated via bundled RSA key)
 
 ---
 
+## Android Auto Navigation Metadata (Binary Analysis Mar 2026)
+
+> **Source:** First-ever unpacking of ARMAndroidAuto binary (1.4MB code dump from `/proc/PID/mem`). 10,804 unique strings extracted. Live adapter capture during active AA Google Maps session.
+
+### Finding: AA Navigation IS Forwarded Over USB as NaviJSON
+
+**CORRECTION (emulator logcat capture, Mar 2026):** The adapter DOES convert AA navigation protobuf to NaviJSON and sends it as `MediaData 0x2A subtype 200`. The earlier SSH ttyLog capture missed this because `_SendNaviJSON` is not logged for AA sessions (the conversion happens inside ARMAndroidAuto's packed code, not ARMiPhoneIAP2).
+
+**Emulator proof** (carlink_native `[RECV]` logs during active AA Google Maps session):
+```
+[RECV] MediaData(type=NAVI_JSON)
+NaviJSON: keys=[NaviStatus], values=NaviStatus=1                           ← Nav active
+NaviJSON: keys=[NaviRoadName, NaviTurnSide, NaviOrderType, NaviTurnAngle, NaviRoundaboutExit]
+    values=NaviRoadName=toward Monkshood Ln, NaviTurnSide=0, NaviOrderType=1, NaviTurnAngle=0
+NaviJSON: keys=[NaviRemainDistance, NaviNextTurnTimeSeconds]
+    values=NaviRemainDistance=0, NaviNextTurnTimeSeconds=0
+```
+
+**Critical difference from CarPlay NaviJSON:** AA uses `NaviOrderType` for maneuver type, NOT `NaviManeuverType`. The ManeuverMapper currently reads `NaviManeuverType` which is absent in AA NaviJSON — causing all maneuvers to fall back to type 0 (STRAIGHT).
+
+**Observed turn event format (adapter-side only, NOT sent over USB):**
+```
+Turn Event, Street: toward Monkshood Ln, turn_side: 3, event: NextTurn_Enum_DEPART,
+image size: 1739, turn_number: 0, turn_angle: 0
+Distance Event, Distance (meters): 0, Time To Turn (seconds): 0
+```
+
+### AA Navigation Protocol (aasdk Protobuf)
+
+ARMAndroidAuto uses the OpenAuto SDK (`aasdk`) with these navigation protobuf types:
+
+| Message | Fields |
+|---------|--------|
+| `NavigationTurnEvent` | NextTurn enum, turn_side, turn_angle, turn_number, image (PNG bytes) |
+| `NavigationDistanceEvent` | display_distance_e3, display_distance_unit (DistanceUnit enum) |
+| `NavigationStatus` | status enum (ACTIVE/INACTIVE) |
+| `NavigationFocusRequest/Response` | focus type for audio ducking |
+
+### AA NextTurn Enum (18 values — NOT CPManeuverType)
+
+```
+DEPART, DESTINATION, FERRY_BOAT, FERRY_TRAIN, FORK, MERGE,
+NAME_CHANGE, OFF_RAMP, ON_RAMP, ROUNDABOUT_ENTER,
+ROUNDABOUT_ENTER_AND_EXIT, ROUNDABOUT_EXIT, SHARP_TURN,
+SLIGHT_TURN, STRAIGHT, TURN, U_TURN, UNKNOWN
+```
+
+These 18 values are **semantically different** from CarPlay's 54 CPManeuverType values. AA's `TURN` is generic (no left/right), `FORK` has no direction, `SHARP_TURN` has no side. The `turn_side` field (LEFT/RIGHT/UNSPECIFIED) provides direction separately.
+
+### What Gets Sent to Host (AA)
+
+| Signal | Command/Message | Purpose |
+|--------|----------------|---------|
+| Navigation started | `RequestNaviFocus(506)` + `NaviStatus=1` via NaviJSON | Audio ducking + status |
+| Navigation stopped | `ReleaseNaviFocus(507)` + `NaviStatus=2` via NaviJSON | Release focus + status |
+| Turn-by-turn data | **NaviJSON via MediaData 0x2A subtype 200** | Road name, maneuver type, turn side |
+| Distance/time | **NaviJSON** (`NaviRemainDistance`, `NaviNextTurnTimeSeconds`) | Distance to next turn (may be 0 when stationary) |
+| Maneuver icons | **NOT SENT** — 1739-byte PNGs logged on adapter but not forwarded | AA provides rendered icons, not used |
+
+### AA NaviJSON Field Mapping (differs from CarPlay)
+
+| AA NaviJSON Field | CarPlay NaviJSON Field | Notes |
+|-------------------|----------------------|-------|
+| `NaviOrderType` | `NaviManeuverType` | **Different field name AND different enum values** |
+| `NaviRoadName` | `NaviRoadName` | Same field, same format |
+| `NaviTurnSide` | `NaviTurnSide` | Same field |
+| `NaviTurnAngle` | `NaviTurnAngle` | Same field |
+| `NaviRoundaboutExit` | `NaviRoundaboutExit` | Same field |
+| `NaviRemainDistance` | `NaviRemainDistance` | Same field |
+| `NaviNextTurnTimeSeconds` | (not present in CarPlay) | AA-specific time-to-turn field |
+| `NaviStatus` | `NaviStatus` | Same field (1=active, 2=inactive) |
+| (absent) | `NaviManeuverType` | **Missing in AA NaviJSON — causes ManeuverMapper fallback to 0** |
+| (absent) | `NaviDistanceToDestination` | Not observed in AA |
+| (absent) | `NaviDestinationName` | Not observed in AA |
+| (absent) | `NaviAPPName` | Not observed in AA |
+
+### Wrong Arrow Root Cause
+
+carlink_native's `NavigationStateManager.kt` reads `NaviManeuverType` for the maneuver. AA NaviJSON sends `NaviOrderType` instead. Since `NaviManeuverType` is absent, `ManeuverMapper` receives type 0 and maps it to `TYPE_STRAIGHT` — producing a straight arrow regardless of the actual turn direction.
+
+**Fix:** `NavigationStateManager` should fall back to `NaviOrderType` when `NaviManeuverType` is absent. The `NaviOrderType` enum values still need mapping analysis (value 1 = DEPART observed, other values TBD from longer driving sessions).
+
+### ARMAndroidAuto Binary Architecture (First Unpacking)
+
+- **Build path:** `/home/hcw/M6PackTools/HeweiPackTools/AndroidAuto_Wireless/openauto-v2/`
+- **Framework:** Modified OpenAuto (open-source AA head unit) by HeWei Communications
+- **Packer:** Custom LZMA (magic `0x55225522`), statically linked, no section headers
+- **Packed size:** 489KB → **Unpacked code segment:** 1.4MB (1,445,888 bytes at 0x10000-0x171000)
+- **Linked libraries:** libc, libpthread, libstdc++, libm, librt, libdl, libcrypto, libssl, libusb
+- **13 service channels:** Video, 3×Audio, AVInput, Input, Sensor, Navigation, Bluetooth, Phone, Media, Notification, VendorExtension
+- **Protobuf messages:** 40+ message types, 40+ enums for full AA protocol coverage
+- **MiddleMan IPC:** `CAndroidAuto_MiddleManInterface` communicates with ARMadb-driver via unix socket
+
+> **Source:** Binary dump from adapter `/proc/PID/mem`, strings analysis at `/Users/zeno/Downloads/misc/cpc200_ccpa_firmware_binaries/analysis/ARMAndroidAuto_strings.txt`
+
+---
+
 ## Navigation Video Setup (iOS 13+)
 
 ### What Is Required (Testing Verified Feb 2026)

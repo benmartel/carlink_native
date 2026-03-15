@@ -4,6 +4,7 @@ import android.os.SystemClock
 import com.carlink.logging.Logger
 import com.carlink.logging.logInfo
 import com.carlink.logging.logNavi
+import com.carlink.logging.logWarn
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -72,6 +73,31 @@ object NavigationStateManager {
     /** Timestamp (elapsedRealtime) of the last maneuver-bearing message. */
     private var lastManeuverMs = 0L
 
+    private fun orderTypeToCpManeuverType(orderType: Int, turnSide: Int, roundaboutExit: Int): Int =
+        when (orderType) {
+            0  -> 5                                          // MERGE → followRoad
+            1  -> 11                                         // DEPART → proceedToRoute
+            4  -> 3                                          // NAME_CHANGE → straight
+            5  -> if (turnSide == 1) 49 else 50              // SLIGHT_TURN → slightLeft/Right
+            6  -> if (turnSide == 1) 1 else 2                // TURN → left/right
+            7  -> if (turnSide == 1) 47 else 48              // SHARP_TURN → sharpLeft/Right
+            8  -> 4                                          // U_TURN → uTurn
+            9  -> 9                                          // ON_RAMP → rampOn
+            10 -> if (turnSide == 1) 22 else 23              // OFF_RAMP → rampOffLeft/Right
+            11 -> if (turnSide == 1) 52 else 53              // FORK → changeHwyLeft/Right
+            13 -> 6                                          // ROUNDABOUT_ENTER
+            14 -> 7                                          // ROUNDABOUT_EXIT
+            15 -> 27 + roundaboutExit.coerceIn(1, 19)       // ROUNDABOUT_E&E → exit 1-19
+            16 -> 3                                          // STRAIGHT
+            18 -> 15                                         // FERRY_BOAT → enterFerry
+            19 -> 15                                         // FERRY_TRAIN → enterFerry
+            21 -> 12                                         // DESTINATION → arrived
+            else -> {
+                logWarn("[NAVI] Unknown NaviOrderType=$orderType turnSide=$turnSide", tag = Logger.Tags.NAVI)
+                5
+            }
+        }
+
     /**
      * Process an incoming NaviJSON payload (incremental update).
      *
@@ -100,7 +126,7 @@ object NavigationStateManager {
 
         // Burst detection: a maneuver-bearing message within BURST_THRESHOLD_MS of the
         // previous one is the adapter firmware's preview of the next maneuver.
-        val isManeuverMessage = payload.containsKey("NaviManeuverType")
+        val isManeuverMessage = payload.containsKey("NaviManeuverType") || payload.containsKey("NaviOrderType")
         val now = SystemClock.elapsedRealtime()
         val gapMs = now - lastManeuverMs
         val isBurst = isManeuverMessage && lastManeuverMs > 0 && gapMs < BURST_THRESHOLD_MS
@@ -110,6 +136,18 @@ object NavigationStateManager {
         }
 
         val current = _state.value
+
+        // Resolve maneuver type: CarPlay sends NaviManeuverType; AA sends NaviOrderType
+        val rawCpType = (payload["NaviManeuverType"] as? Number)?.toInt()
+        val rawOrderType = (payload["NaviOrderType"] as? Number)?.toInt()
+        val rawTurnSide = (payload["NaviTurnSide"] as? Number)?.toInt() ?: current.turnSide
+        val rawRoundaboutExit = (payload["NaviRoundaboutExit"] as? Number)?.toInt() ?: current.roundaboutExit
+        val resolvedManeuverType = rawCpType
+            ?: rawOrderType?.let { orderTypeToCpManeuverType(it, rawTurnSide, rawRoundaboutExit) }
+
+        if (rawCpType == null && rawOrderType != null) {
+            logNavi { "[NAVI] AA orderType=$rawOrderType turnSide=$rawTurnSide → cpType=$resolvedManeuverType" }
+        }
 
         if (isBurst) {
             // Burst: route maneuver-specific fields to next-step slots.
@@ -128,7 +166,7 @@ object NavigationStateManager {
                     appName = (payload["NaviAPPName"] as? String)?.takeIf { it.isNotEmpty() } ?: current.appName,
                     turnSide = (payload["NaviTurnSide"] as? Number)?.toInt() ?: current.turnSide,
                     // Maneuver fields → next-step
-                    nextManeuverType = (payload["NaviManeuverType"] as? Number)?.toInt(),
+                    nextManeuverType = resolvedManeuverType,
                     nextOrderType = (payload["NaviOrderType"] as? Number)?.toInt(),
                     nextRoadName = (payload["NaviRoadName"] as? String)?.takeIf { it.isNotEmpty() },
                     nextTurnAngle = (payload["NaviTurnAngle"] as? Number)?.toInt(),
@@ -151,7 +189,7 @@ object NavigationStateManager {
         val merged =
             current.copy(
                 status = naviStatus ?: current.status,
-                maneuverType = (payload["NaviManeuverType"] as? Number)?.toInt() ?: current.maneuverType,
+                maneuverType = resolvedManeuverType ?: current.maneuverType,
                 orderType = (payload["NaviOrderType"] as? Number)?.toInt() ?: current.orderType,
                 roadName = (payload["NaviRoadName"] as? String)?.takeIf { it.isNotEmpty() } ?: current.roadName,
                 remainDistance = (payload["NaviRemainDistance"] as? Number)?.toInt() ?: current.remainDistance,
