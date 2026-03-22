@@ -30,9 +30,10 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Patch applicationId
+      - name: Patch applicationId and content provider
         run: |
           sed -i "s|applicationId = \"zeno.carlink\"|applicationId = \"${{ secrets.APP_ID }}\"|g" app/build.gradle.kts
+          sed -i "s|com.google.android.apps.automotive.templates.host.ClusterIconContentProvider|${{ secrets.APP_ID }}.ClusterIconContentProvider|g" app/src/main/AndroidManifest.xml
           echo "Applied applicationId: ${{ secrets.APP_ID }}"
 
       - name: Build release bundle
@@ -50,7 +51,6 @@ jobs:
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
 
-      # Save AAB always, even if Play upload fails
       - name: Upload AAB artifact
         if: always()
         uses: actions/upload-artifact@v4
