@@ -50,6 +50,15 @@ jobs:
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
 
+      # Save AAB always, even if Play upload fails
+      - name: Upload AAB artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aab
+          path: app/build/outputs/bundle/release/
+          retention-days: 14
+
       - name: Upload to Google Play Internal Testing
         uses: r0adkll/upload-google-play@v1
         with:
@@ -58,10 +67,3 @@ jobs:
           releaseFiles: ${{ steps.sign_aab.outputs.signedReleaseFile }}
           track: internal
           status: completed
-
-      - name: Upload AAB artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-aab
-          path: ${{ steps.sign_aab.outputs.signedReleaseFile }}
-          retention-days: 14
