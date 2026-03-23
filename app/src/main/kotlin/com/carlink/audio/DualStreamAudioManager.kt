@@ -104,6 +104,21 @@ class DualStreamAudioManager(
         logDebug("[AUDIO_FOCUS] FocusChange: $changeStr → focusDuckLevel=${(newLevel * 100).toInt()}%")
         focusDuckLevel = newLevel
         applyEffectiveVolume()
+        // Fix 2: Bluetooth connect causes AUDIOFOCUS_LOSS then AUDIOFOCUS_GAIN on GM AAOS.
+        // When focus is regained, ensure the active media track is still playing.
+        // If it was silenced/stopped during the loss, trigger re-prefill so audio resumes.
+        if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+            synchronized(lock) {
+                activeMediaSlot?.let { slot ->
+                    val track = slot.track
+                    if (track != null && track.playState != AudioTrack.PLAYSTATE_PLAYING && slot.started) {
+                        slot.pendingPlay = true
+                        slot.started = false
+                        log("[AUDIO_FOCUS] Re-triggering media pre-fill after focus regained (BT connect recovery)")
+                    }
+                }
+            }
+        }
     }
 
     private var playbackThread: AudioPlaybackThread? = null
