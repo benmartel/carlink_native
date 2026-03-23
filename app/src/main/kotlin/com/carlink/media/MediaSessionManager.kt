@@ -450,6 +450,15 @@ class MediaSessionManager(
         log("[MEDIA_SESSION] Play sent — suppressing AVRCP pause for ${AVRCP_PAUSE_SUPPRESS_MS}ms")
     }
 
+    /**
+     * Called when adapter confirms play is active (MediaPlayStatus=1).
+     * Clears the AVRCP pause suppression window so real user pause events work.
+     */
+    fun notifyPlayAcknowledged() {
+        lastPlayCommandTimeMs.set(0L)
+        log("[MEDIA_SESSION] Play acknowledged by adapter — AVRCP suppress window cleared")
+    }
+
     private val mediaSessionCallback =
         object : MediaSessionCompat.Callback() {
             override fun onPlay() {
