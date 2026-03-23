@@ -69,3 +69,4 @@ jobs:
           releaseFiles: ${{ steps.sign_aab.outputs.signedReleaseFile }}
           track: internal
           status: completed
+          changesNotSentForReview: true
