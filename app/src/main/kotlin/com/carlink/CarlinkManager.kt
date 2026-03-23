@@ -1951,6 +1951,11 @@ class CarlinkManager(
         }
 
         // Always update playback state (position ticks are the common case)
+        // If adapter confirms MediaPlayStatus=1 (play acknowledged), clear AVRCP suppress window
+        // so legitimate pause events work immediately after play is confirmed.
+        if (isPlaying) {
+            mediaSessionManager?.notifyPlayAcknowledged()
+        }
         mediaSessionManager?.updatePlaybackState(playing = isPlaying, position = position)
     }
 
