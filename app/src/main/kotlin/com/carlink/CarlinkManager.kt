@@ -1,7 +1,14 @@
 package com.carlink
 
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.usb.UsbManager
+import android.media.AudioManager as AndroidAudioManager
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.view.Surface
 import androidx.core.content.edit
@@ -221,6 +228,9 @@ class CarlinkManager(
     // Audio
     private var audioManager: DualStreamAudioManager? = null
     private var audioInitialized = false
+
+    // Bluetooth / AudioFocus receiver (Fix 1 & 3)
+    private var btAudioReceiver: BroadcastReceiver? = null
 
     // Microphone
     private var microphoneManager: MicrophoneCaptureManager? = null
@@ -638,6 +648,47 @@ class CarlinkManager(
             }
         }
 
+        // Fix 1 & 3: Register BT audio broadcast receiver
+        // Handles ACTION_AUDIO_BECOMING_NOISY (audio routing change) and
+        // ACTION_ACL_CONNECTED (BT device connects) to re-assert AudioFocus.
+        if (btAudioReceiver == null) {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: android.content.Context, intent: Intent) {
+                    when (intent.action) {
+                        AndroidAudioManager.ACTION_AUDIO_BECOMING_NOISY -> {
+                            // Fix 1: Audio output routing is changing (e.g. BT headset connected/disconnected).
+                            // Re-request focus so AAOS knows we still want to play after the routing change.
+                            logInfo("[BT_AUDIO] AUDIO_BECOMING_NOISY — re-requesting media focus", tag = Logger.Tags.AUDIO)
+                            if (!config.audioTransferMode) {
+                                audioManager?.onPurposeEnded(com.carlink.protocol.StreamPurpose.MEDIA)
+                                audioManager?.onPurposeChanged(com.carlink.protocol.StreamPurpose.MEDIA)
+                            }
+                        }
+                        BluetoothDevice.ACTION_ACL_CONNECTED -> {
+                            // Fix 3: A BT device connected. GM AAOS CarAudioService may revoke
+                            // AudioFocus during the A2DP/SCO routing transition. After 600ms
+                            // (routing settles), abandon and re-request focus so audio resumes.
+                            logInfo("[BT_AUDIO] ACL_CONNECTED — scheduling focus re-request", tag = Logger.Tags.AUDIO)
+                            if (!config.audioTransferMode) {
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    audioManager?.onPurposeEnded(com.carlink.protocol.StreamPurpose.MEDIA)
+                                    audioManager?.onPurposeChanged(com.carlink.protocol.StreamPurpose.MEDIA)
+                                    logInfo("[BT_AUDIO] Media focus re-requested after BT connect", tag = Logger.Tags.AUDIO)
+                                }, 600L)
+                            }
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter().apply {
+                addAction(AndroidAudioManager.ACTION_AUDIO_BECOMING_NOISY)
+                addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
+            }
+            context.registerReceiver(receiver, filter)
+            btAudioReceiver = receiver
+            logInfo("[BT_AUDIO] BT audio broadcast receiver registered", tag = Logger.Tags.AUDIO)
+        }
+
         // Find device
         log("Searching for Carlinkit device...")
         val device = findDevice()
@@ -916,6 +967,10 @@ class CarlinkManager(
         mediaSessionManager?.release()
         CarlinkMediaBrowserService.mediaSessionToken = null
         mediaSessionManager = null
+
+        // Unregister BT audio receiver (Fix 1 & 3)
+        btAudioReceiver?.let { context.unregisterReceiver(it) }
+        btAudioReceiver = null
 
         // Cancel coroutine scope to stop any in-flight coroutines that hold
         // references to this manager and its context
