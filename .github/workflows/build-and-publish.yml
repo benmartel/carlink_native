@@ -34,8 +34,8 @@ jobs:
         run: |
           sed -i "s|applicationId = \"zeno.carlink\"|applicationId = \"${{ secrets.APP_ID }}\"|g" app/build.gradle.kts
           sed -i "s|com.google.android.apps.automotive.templates.host.ClusterIconContentProvider|${{ secrets.APP_ID }}.ClusterIconContentProvider|g" app/src/main/AndroidManifest.xml
-          NEW_VERSION_CODE=$((96 + ${{ github.run_number }}))
-          sed -i "s|versionCode = 96|versionCode = ${NEW_VERSION_CODE}|g" app/build.gradle.kts
+          NEW_VERSION_CODE=$((103 + ${{ github.run_number }}))
+          sed -i "s|versionCode = 103|versionCode = ${NEW_VERSION_CODE}|g" app/build.gradle.kts
           echo "Applied applicationId: ${{ secrets.APP_ID }}, versionCode: ${NEW_VERSION_CODE}"
 
       - name: Build release bundle
@@ -52,6 +52,8 @@ jobs:
           alias: ${{ secrets.KEY_ALIAS }}
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
+                  env:
+                            BUILD_TOOLS_VERSION: "34.0.0"
 
       - name: Upload AAB artifact
         if: always()
