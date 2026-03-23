@@ -572,6 +572,9 @@ class CarlinkManager(
                         object : MediaSessionManager.MediaControlCallback {
                             override fun onPlay() {
                                 sendKey(CommandMapping.PLAY)
+                                // Notify MediaSession to suppress the AVRCP BT handoff pause
+                                // that the GM head unit sends immediately after seeing STATE_PLAYING
+                                mediaSessionManager?.notifyPlaySent()
                             }
 
                             override fun onPause() {
