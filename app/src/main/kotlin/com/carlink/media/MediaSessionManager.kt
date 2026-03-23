@@ -11,6 +11,7 @@ import android.util.Log
 import com.carlink.BuildConfig
 import com.carlink.MainActivity
 import com.carlink.util.LogCallback
+import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "CARLINK_MEDIA"
 
@@ -72,6 +73,22 @@ class MediaSessionManager(
 
     /** Position must drift more than this from AAOS-extrapolated value to trigger a push (seek). */
     private val seekThresholdMs: Long = 2_000L
+
+    /**
+     * AVRCP Pause Suppression (BT conflict fix).
+     *
+     * When the phone connects via Bluetooth, the GM AAOS head unit sends an AVRCP Pause
+     * to the phone the moment it sees the MediaSession go PLAYING — trying to hand off
+     * media authority to the car. This pause bounces back to us via the MediaSession
+     * callback and creates an infinite stop loop.
+     *
+     * Fix: after a Play command is sent to the adapter, suppress any incoming onPause()
+     * from the MediaSession for AVRCP_PAUSE_SUPPRESS_MS milliseconds.
+     * The head unit will receive STATE_PLAYING pushed back immediately,
+     * satisfying its "is someone playing?" check without stopping music.
+     */
+    private val lastPlayCommandTimeMs = AtomicLong(0L)
+    private val AVRCP_PAUSE_SUPPRESS_MS = 1500L  // window to ignore post-play AVRCP pause
 
     // Album art bitmap cache — avoids redundant BitmapFactory.decodeByteArray on same cover
     private var cachedAlbumArtHash: Int = 0
@@ -409,15 +426,39 @@ class MediaSessionManager(
     /**
      * MediaSession callback for handling media button events from AAOS/steering wheel.
      */
+    /**
+     * Called by CarlinkManager after a PLAY command is sent to the adapter.
+     * Starts the AVRCP pause suppression window.
+     */
+    fun notifyPlaySent() {
+        lastPlayCommandTimeMs.set(System.currentTimeMillis())
+        log("[MEDIA_SESSION] Play sent — suppressing AVRCP pause for ${AVRCP_PAUSE_SUPPRESS_MS}ms")
+    }
+
     private val mediaSessionCallback =
         object : MediaSessionCompat.Callback() {
             override fun onPlay() {
                 log("[MEDIA_SESSION] onPlay received")
+                notifyPlaySent()
                 mediaControlCallback?.onPlay()
             }
 
             override fun onPause() {
-                log("[MEDIA_SESSION] onPause received")
+                val msSincePlay = System.currentTimeMillis() - lastPlayCommandTimeMs.get()
+                if (msSincePlay < AVRCP_PAUSE_SUPPRESS_MS) {
+                    // AVRCP Pause Suppression: this pause arrived within the suppress window
+                    // after a Play command — it is the GM head unit’s BT AVRCP handoff, not
+                    // a user action. Ignore it and immediately push STATE_PLAYING back to
+                    // prevent the head unit from thinking playback has stopped.
+                    log("[MEDIA_SESSION] onPause SUPPRESSED (AVRCP BT handoff, ${msSincePlay}ms after play)")
+                    synchronized(sessionLock) {
+                        if (isPlaying) {
+                            mediaSession?.setPlaybackState(buildPlaybackState(android.support.v4.media.session.PlaybackStateCompat.STATE_PLAYING, currentPosition))
+                        }
+                    }
+                    return
+                }
+                log("[MEDIA_SESSION] onPause received (${msSincePlay}ms after last play — user action)")
                 mediaControlCallback?.onPause()
             }
 
