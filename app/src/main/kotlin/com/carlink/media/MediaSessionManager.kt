@@ -88,7 +88,7 @@ class MediaSessionManager(
      * satisfying its "is someone playing?" check without stopping music.
      */
     private val lastPlayCommandTimeMs = AtomicLong(0L)
-    private val AVRCP_PAUSE_SUPPRESS_MS = 1500L  // window to ignore post-play AVRCP pause
+    private val AVRCP_PAUSE_SUPPRESS_MS = 3000L  // window to ignore post-play AVRCP pause
 
     // Album art bitmap cache — avoids redundant BitmapFactory.decodeByteArray on same cover
     private var cachedAlbumArtHash: Int = 0
@@ -296,6 +296,21 @@ class MediaSessionManager(
     ) {
         synchronized(sessionLock) {
             val session = mediaSession ?: return
+
+            // AVRCP Pause Suppression: adapter-level feedback.
+            // When the GM head unit sends AVRCP Pause to the phone via BT, the phone pauses,
+            // the adapter reports MediaPlayStatus=0, and this updatePlaybackState(false) is called.
+            // This creates the same circular loop as the MediaSession.onPause() path.
+            // Suppress playing=false updates that arrive within the AVRCP window after a Play command.
+            if (!playing) {
+                val msSincePlay = System.currentTimeMillis() - lastPlayCommandTimeMs.get()
+                if (msSincePlay < AVRCP_PAUSE_SUPPRESS_MS) {
+                    log("[MEDIA_SESSION] updatePlaybackState(false) SUPPRESSED (AVRCP BT adapter feedback, " + msSincePlay + "ms after play)")
+                    // Re-assert PLAYING so the head unit does not loop
+                    session.setPlaybackState(buildPlaybackState(PlaybackStateCompat.STATE_PLAYING, currentPosition))
+                    return
+                }
+            }
 
             isPlaying = playing
             currentPosition = position
