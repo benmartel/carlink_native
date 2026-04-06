@@ -106,12 +106,12 @@ class MicrophoneCaptureManager(
 
     @Volatile private var overrunCount: Int = 0
 
-    // 500ms buffer prevents overruns when main thread blocked (Session 6 fix)
+    // 500ms buffer prevents overruns when main thread blocked
     private val bufferCapacityMs = 500
     private val captureChunkMs = 20
 
     // Pre-allocated read buffer — reused by readChunk() to avoid per-call allocation.
-    // Sized for max readChunk request (640 bytes = 20ms of 16kHz mono PCM16).
+    // Initially sized for 16kHz mono 20ms (640B); grows on demand if readChunk requests more.
     // Safe to reuse: caller (sendMicrophoneData) consumes data synchronously before next tick.
     private var readBuffer = ByteArray(640)
 

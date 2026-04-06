@@ -6,6 +6,8 @@ import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import com.carlink.platform.AudioConfig
 import com.carlink.protocol.AudioRoutingState
@@ -50,7 +52,7 @@ object AudioStreamType {
  * PCM packets are routed by two-factor matching: audio command state flags + format match.
  * This prevents transition artifacts where media PCM briefly routes to the wrong AudioTrack
  * when purpose changes (e.g., SIRI_START arrives but adapter still sends media PCM).
- * - audioType=2 → Navigation (unchanged)
+ * - audioType=2 → Navigation
  * - audioType=1 + isPhoneCallActive + 8kHz mono → PhoneCall track
  * - audioType=1 + isSiriActive + 16kHz mono → Siri track
  * - audioType=1 + isAlertActive + 24kHz mono → Alert track
@@ -107,7 +109,6 @@ class DualStreamAudioManager(
     private val isRunning = AtomicBoolean(false)
 
     private var navUnderruns: Int = 0
-    private var zeroPacketsFiltered: Long = 0
 
     // 30s aggregate stats counters (per-window deltas, reset each interval)
     private val statsInterval = 30_000L
@@ -125,7 +126,7 @@ class DualStreamAudioManager(
     private val bufferMultiplier = audioConfig.bufferMultiplier
     private val prefillThresholdMs = audioConfig.prefillThresholdMs
     private val underrunRecoveryThreshold = 10
-    private val minBufferLevelMs = 50 // Reduced from 100ms - USB P99 jitter only 7ms
+    private val minBufferLevelMs = 50 // ~7x headroom over measured USB P99 jitter (7ms)
 
     @Volatile private var navStarted = false
 
@@ -333,7 +334,7 @@ class DualStreamAudioManager(
             }
 
             navEndMarkersDetected++
-            log("[AUDIO] Nav end marker detected, buffers flushed (total: $navEndMarkersDetected)")
+            log("[AUDIO] Nav end marker detected, buffers flushed — discarded=${discardedMs}ms (total: $navEndMarkersDetected)")
         }
     }
 
@@ -351,7 +352,6 @@ class DualStreamAudioManager(
         // Navigation handles zeros separately for consecutive tracking and buffer flush
         val isZeroFilled = isZeroFilledAudio(data, dataOffset, dataLength)
         if (isZeroFilled && audioType != AudioStreamType.NAVIGATION) {
-            zeroPacketsFiltered++
             windowZeroFiltered.incrementAndGet()
             return 0
         }
@@ -373,7 +373,6 @@ class DualStreamAudioManager(
                 // Consecutive zeros cause resampling noise on GM AAOS (44.1kHz→48kHz)
                 if (isZeroFilled) {
                     consecutiveNavZeroPackets++
-                    zeroPacketsFiltered++
                     windowZeroFiltered.incrementAndGet()
                     if (consecutiveNavZeroPackets >= navZeroFlushThreshold) {
                         flushNavBuffers()
@@ -414,7 +413,7 @@ class DualStreamAudioManager(
                 // Two-factor routing: state flags + format match → pre-allocated slot
                 windowMediaRx.incrementAndGet()
                 val format = AudioFormats.fromDecodeType(decodeType)
-                val targetSlot = resolveTargetSlot(format, routingState)
+                val targetSlot = resolveTargetSlot(format, routingState) ?: return 0
                 ensureSlotFormat(targetSlot, format)
                 // Activate slot if track is not yet playing (pre-allocated slots start in STOPPED)
                 if (!targetSlot.pendingPlay && targetSlot.track?.playState != AudioTrack.PLAYSTATE_PLAYING) {
@@ -474,11 +473,22 @@ class DualStreamAudioManager(
                         .setContentType(contentType)
                         .build(),
                 )
-                .setOnAudioFocusChangeListener(focusChangeListener)
+                .setOnAudioFocusChangeListener(focusChangeListener, Handler(Looper.getMainLooper()))
                 .build()
 
             val result = systemAudioManager.requestAudioFocus(focusRequest)
             activeFocusRequests[purpose] = focusRequest
+
+            // Reset focusDuckLevel when focus is granted synchronously.
+            // Android uses the listener as identity key — a new request silently replaces
+            // the prior one on the focus stack. When the old request is later abandoned,
+            // no AUDIOFOCUS_GAIN callback fires, leaving focusDuckLevel stuck at 0.0f.
+            // This ensures media volume is restored after purpose transitions (e.g., phone call → media).
+            if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED && focusDuckLevel != 1.0f) {
+                logDebug("[AUDIO_FOCUS] Reset focusDuckLevel=100% (focus granted for $purpose)")
+                focusDuckLevel = 1.0f
+                applyEffectiveVolume()
+            }
 
             val resultStr = when (result) {
                 AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> "GRANTED"
@@ -596,6 +606,7 @@ class DualStreamAudioManager(
             navStopped = false // Reset stopped state for next nav session
             navPackets = 0 // Reset packet counter for next nav prompt
             navUnderruns = 0 // Reset underrun counter for next nav prompt
+            navWarmupFramesSkipped = 0 // Reset per-prompt warmup skip counter
             // Abandon nav focus
             onPurposeEnded(StreamPurpose.NAVIGATION)
             logDebug("[AUDIO_FOCUS] Nav focus abandoned (stopNavTrack)")
@@ -673,17 +684,23 @@ class DualStreamAudioManager(
      * During transitions (e.g., SIRI_START sent but adapter still sending media PCM),
      * the format won't match the target purpose, so media PCM stays on the MEDIA track.
      */
-    private fun resolveTargetSlot(format: AudioFormatConfig, state: AudioRoutingState): PurposeSlot {
-        if (state.isPhoneCallActive && format.sampleRate <= 8000 && format.channelCount == 1) {
-            return phoneCallSlot!!
+    private fun resolveTargetSlot(format: AudioFormatConfig, state: AudioRoutingState): PurposeSlot? {
+        // 8kHz = AA phone calls (HFP/SCO narrowband), 16kHz = CarPlay phone calls (iAP2 wideband)
+        val slot = if (state.isPhoneCallActive && (format.sampleRate == 8000 || format.sampleRate == 16000) && format.channelCount == 1) {
+            phoneCallSlot
+        } else if (state.isSiriActive && format.sampleRate == 16000 && format.channelCount == 1) {
+            siriSlot
+        } else if (state.isAlertActive && format.sampleRate == 24000 && format.channelCount == 1) {
+            alertSlot
+        } else {
+            mediaSlot // Default: all other audio (including transition-period media)
         }
-        if (state.isSiriActive && format.sampleRate == 16000 && format.channelCount == 1) {
-            return siriSlot!!
-        }
-        if (state.isAlertActive && format.sampleRate == 24000 && format.channelCount == 1) {
-            return alertSlot!!
-        }
-        return mediaSlot!! // Default: all other audio (including transition-period media)
+        logDebug(
+            "[AUDIO_ROUTE] ${format.sampleRate}Hz/${format.channelCount}ch " +
+                "state=(call=${state.isPhoneCallActive} siri=${state.isSiriActive} alert=${state.isAlertActive}) " +
+                "→ ${slot?.purpose ?: "null"}",
+        )
+        return slot
     }
 
     /** Ensure slot's AudioTrack matches incoming format; recreate if different (rare). */
@@ -746,7 +763,7 @@ class DualStreamAudioManager(
                     navStartTime = System.currentTimeMillis()
                     // Request nav focus on resume
                     onPurposeChanged(StreamPurpose.NAVIGATION)
-                    log("[AUDIO] Resumed paused nav track with flush (same format ${format.sampleRate}Hz)")
+                    log("[AUDIO] Resumed paused nav track with flush — discarded=${discardedMs}ms (same format ${format.sampleRate}Hz)")
                     return
                 }
             }
@@ -1079,29 +1096,9 @@ class DualStreamAudioManager(
                             }
                         }
 
-                        // Idle-pause: pause track after buffer empty for idlePauseMs.
-                        // Prevents AAOS volume keys from being hijacked by stale PLAYING tracks.
-                        if (track.playState == AudioTrack.PLAYSTATE_PLAYING &&
-                            currentFillMs <= minBufferLevelMs && slot.residualCount == 0
-                        ) {
-                            val now = System.currentTimeMillis()
-                            if (slot.idleSince == 0L) {
-                                slot.idleSince = now
-                            } else if (now - slot.idleSince >= idlePauseMs) {
-                                track.pause()
-                                slot.started = false
-                                slot.idleSince = 0
-                                logDebug(
-                                    "[AUDIO] ${slot.purpose} idle-paused " +
-                                        "(no data for ${idlePauseMs}ms)",
-                                )
-                            }
-                        } else {
-                            slot.idleSince = 0
-                        }
                     }
 
-                    // === Navigation: single track (unchanged) ===
+                    // === Navigation: single track ===
                     navBuffer?.let { buffer ->
                         navTrack?.let { track ->
                             if (track.playState == AudioTrack.PLAYSTATE_PLAYING || navPendingPlay) {
@@ -1293,7 +1290,7 @@ class DualStreamAudioManager(
                             .append(mUrun)
                         if (mRes > 0) sb.append(" Res:").append(mRes)
 
-                        // Nav stats (unchanged)
+                        // Nav stats
                         val nFill = navBuffer?.fillLevelMs() ?: 0
                         val nOvf = (navBuffer?.overflowCount ?: 0) - prevNavOverflow
                         val nUrun = navUnderruns - prevNavUnderruns
@@ -1354,7 +1351,7 @@ class DualStreamAudioManager(
                             slot.pendingPlay = false
                             slot.residualCount = 0
                         } else {
-                            // NAV path (unchanged)
+                            // NAV path
                             when (streamType) {
                                 "NAV" -> {
                                     try {

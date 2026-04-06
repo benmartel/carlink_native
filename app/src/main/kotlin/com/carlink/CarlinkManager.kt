@@ -184,7 +184,7 @@ class CarlinkManager(
     }
 
     /**
-     * AA center-crop parameters for TextureView matrix transform and touch remapping.
+     * AA center-crop parameters for SurfaceView oversize/clip layout and touch remapping.
      * Null when not applicable (CarPlay, 16:9 display, or no config yet).
      */
     data class AaCropParams(
@@ -497,7 +497,7 @@ class CarlinkManager(
                     if (dimsChanged && currentPhoneType == PhoneType.ANDROID_AUTO) {
                         resendBoxSettings()
                         // Notify UI so oversized surface recalculates for new crop params
-                        callback?.onPhoneTypeChanged(PhoneType.ANDROID_AUTO)
+                        finalCallback.onPhoneTypeChanged(PhoneType.ANDROID_AUTO)
                     }
 
                     if (codecDeferred && currentPhoneType != null) {
@@ -1111,6 +1111,40 @@ class CarlinkManager(
     }
 
     /**
+     * Refresh the MediaSession to force GM AAOS to re-read metadata.
+     *
+     * GM AAOS occasionally stops updating the now-playing display from an existing
+     * MediaSession. This deactivates/reactivates the session (forces AAOS to re-bind)
+     * and re-pushes all cached metadata and playback state.
+     */
+    fun refreshMediaSession() {
+        val manager = mediaSessionManager
+        if (manager == null) {
+            logWarn("[DEVICE_OPS] Cannot refresh MediaSession — not initialized (Bluetooth audio mode?)", tag = Logger.Tags.ADAPTR)
+            return
+        }
+
+        logInfo("[DEVICE_OPS] Refreshing MediaSession", tag = Logger.Tags.ADAPTR)
+
+        // Deactivate/reactivate session — invalidates dedup state internally
+        manager.refresh()
+
+        // Re-push all cached metadata to the fresh session
+        manager.updateMetadata(
+            title = lastMediaSongName,
+            artist = lastMediaArtistName,
+            album = lastMediaAlbumName,
+            appName = lastMediaAppName,
+            albumArt = lastAlbumCover,
+            duration = lastDuration,
+        )
+        manager.updatePlaybackState(playing = lastIsPlaying, position = lastPosition)
+        CarlinkMediaBrowserService.updateNowPlaying(lastMediaSongName, lastMediaArtistName)
+
+        logInfo("[DEVICE_OPS] MediaSession refresh completed", tag = Logger.Tags.ADAPTR)
+    }
+
+    /**
      * Handle Surface destruction - pause codec IMMEDIATELY.
      *
      * CRITICAL: This is called when SurfaceView's Surface is destroyed, which happens
@@ -1157,19 +1191,6 @@ class CarlinkManager(
         codecDeferred = false
         logInfo("[LIFECYCLE] Starting deferred codec", tag = Logger.Tags.VIDEO)
         renderer.resume(surface)
-    }
-
-    /**
-     * Swap the video surface without re-initializing the full pipeline.
-     * Used when switching between SurfaceView (CarPlay) and TextureView (AA).
-     * Bypasses the debounce — the caller already knows this is the final surface.
-     */
-    fun swapSurface(surface: Surface) {
-        logInfo("[LIFECYCLE] swapSurface() — replacing video surface", tag = Logger.Tags.VIDEO)
-        surfaceUpdateJob?.cancel()
-        surfaceUpdateJob = null
-        this.videoSurface = surface
-        h264Renderer?.resume(surface)
     }
 
     /**
@@ -1788,7 +1809,7 @@ class CarlinkManager(
 
     private fun processAudioData(message: AudioDataMessage) {
         // Handle volume ducking
-        message.volumeDuration?.let { duration ->
+        message.volumeDuration?.let {
             audioManager?.setDucking(message.volume)
             return
         }
@@ -1880,7 +1901,6 @@ class CarlinkManager(
                 } else {
                     logInfo("[AUDIO_CMD] Siri stopped - disabling microphone", tag = Logger.Tags.MIC)
                     activeVoiceMode = VoiceMode.NONE
-                    isSiriAudioActive = false
                     endPurpose(StreamPurpose.SIRI, command)
                     stopMicrophoneCapture()
                 }
@@ -2421,9 +2441,9 @@ class CarlinkManager(
      * Video header structure (20 bytes):
      * - offset 0: width (4 bytes)
      * - offset 4: height (4 bytes)
-     * - offset 8: encoderState (4 bytes) - protocol ID: 3=AA, 7=CarPlay
-     * - offset 12: pts (4 bytes) - SOURCE PRESENTATION TIMESTAMP (milliseconds)
-     * - offset 16: flags (4 bytes) - always 0
+     * - offset 8: encoderState (4 bytes) - encoder generation/stream ID (values echoed in touch flags for AutoKit compat)
+     * - offset 12: pts (4 bytes) - SOURCE PRESENTATION TIMESTAMP (milliseconds, logged only — codec uses elapsed-time PTS)
+     * - offset 16: flags (4 bytes) - usually 0 (reserved)
      */
     private fun createVideoProcessor(): UsbDeviceWrapper.VideoDataProcessor {
         return object : UsbDeviceWrapper.VideoDataProcessor {
@@ -2454,7 +2474,8 @@ class CarlinkManager(
                 }
 
                 // Parse encoder state from video header for touch flags (AutoKit compatibility).
-                // Offset 8: flags field. Bit 0 = offScreen, bits 2-3 = encoderType (0→H264, 1→H265, 2→MJPEG).
+                // Offset 8: AutoKit bitmask convention (bit 0 = offScreen, bits 2-3 = encoderType).
+                // Values echoed in touch payload only — not used for codec decisions.
                 if (dataLength >= 12) {
                     val flags =
                         (data[8].toInt() and 0xFF) or ((data[9].toInt() and 0xFF) shl 8) or

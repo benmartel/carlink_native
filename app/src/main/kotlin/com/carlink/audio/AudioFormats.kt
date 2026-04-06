@@ -41,7 +41,7 @@ data class AudioFormatConfig(
  */
 object AudioFormats {
     val FORMAT_1 = AudioFormatConfig(48000, 2) // Music stereo
-    val FORMAT_2 = AudioFormatConfig(48000, 2) // Music stereo (same as FORMAT_1)
+    val FORMAT_2 = AudioFormatConfig(48000, 2) // Commands/stop signals (decode_type=2, no PCM at 48kHz default)
     val FORMAT_3 = AudioFormatConfig(8000, 1) // Phone calls
     val FORMAT_4 = AudioFormatConfig(48000, 2) // High-quality
     val FORMAT_5 = AudioFormatConfig(16000, 1) // Siri/voice

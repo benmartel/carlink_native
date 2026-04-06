@@ -329,7 +329,7 @@ object MessageSerializer {
         // Google AA only supports 3 fixed H.264 resolutions: 800x480, 1280x720, 1920x1080.
         // androidAutoSizeW = tier width, androidAutoSizeH = content height within the frame.
         // The phone renders content in a centered band, with black bars filling the rest.
-        // The host TextureView applies an AR-correcting center-crop matrix to remove the bars.
+        // The host SurfaceView is oversized to the tier AR and clipped to remove the bars.
         //
         // Use actual surface dims for AR calculation. On AAOS, WindowMetrics (config) may subtract
         // dock/nav insets that Compose's WindowInsets.systemBars doesn't, causing a mismatch.

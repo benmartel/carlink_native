@@ -170,6 +170,7 @@ fun LogPreset.apply() {
             Logger.setTagsEnabled(
                 listOf(
                     Logger.Tags.AUDIO,
+                    Logger.Tags.AUDIO_DEBUG,
                     Logger.Tags.MIC,
                     Logger.Tags.AUDIO_PERF,
                     Logger.Tags.ADAPTR,

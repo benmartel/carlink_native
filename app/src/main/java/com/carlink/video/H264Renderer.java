@@ -10,12 +10,10 @@ package com.carlink.video;
  * - Bare MediaFormat (no KEY_LOW_LATENCY, KEY_PRIORITY, KEY_MAX_INPUT_SIZE, csd-0/csd-1)
  * - All frames fed with flags=0 (no BUFFER_FLAG_CODEC_CONFIG)
  * - PTS from elapsed time: (uptimeMillis - startDecodeTime) * 1000 microseconds
- * - Separate render thread started on first decoded frame
+ * - Separate render thread started on first queued frame
  * - No frame dropping — render all decoded frames immediately
  */
 import android.media.MediaCodec;
-import android.media.MediaCodecInfo;
-import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.os.Process;
 import android.os.SystemClock;
@@ -23,8 +21,6 @@ import android.view.Surface;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -53,7 +49,6 @@ public class H264Renderer {
     private static final class StagedFrame {
         final byte[] data;
         int length;
-        long timestamp;
         StagedFrame(int capacity) {
             this.data = new byte[capacity];
         }
@@ -64,6 +59,7 @@ public class H264Renderer {
     private int height;
     private Surface surface;
     private volatile boolean running = false;
+    private volatile boolean stopped = false;     // Permanent shutdown — prevents timer resurrection
     private volatile java.util.Timer retryTimer;  // Stored for cancellation in stop()
     private final LogCallback logCallback;
     private KeyframeRequestCallback keyframeCallback;
@@ -333,6 +329,7 @@ public class H264Renderer {
     }
 
     public void start() {
+        if (stopped) return;
         if (running) return;
 
         running = true;
@@ -367,18 +364,27 @@ public class H264Renderer {
 
             running = false;
 
-            log("restarting in 5s");
-            retryTimer = new java.util.Timer();
-            retryTimer.schedule(new java.util.TimerTask() {
-                @Override
-                public void run() {
-                    start();
-                }
-            }, 5000);
+            if (!stopped) {
+                log("restarting in 5s");
+                retryTimer = new java.util.Timer();
+                retryTimer.schedule(new java.util.TimerTask() {
+                    @Override
+                    public void run() {
+                        start();
+                    }
+                }, 5000);
+            }
         }
     }
 
     public void stop() {
+        stopped = true;
+        stopInternal();
+    }
+
+    /** Internal stop — tears down codec without setting the permanent stopped flag.
+     *  Used by reset() and resume() for mid-session restarts. */
+    private void stopInternal() {
         // Cancel any pending start() retry to prevent resurrection after stop().
         if (retryTimer != null) {
             retryTimer.cancel();
@@ -422,7 +428,7 @@ public class H264Renderer {
             lastLifecycleEventTime = System.currentTimeMillis();
 
             Surface savedSurface = this.surface;
-            stop();
+            stopInternal();
             this.surface = savedSurface;
             start();
 
@@ -465,7 +471,7 @@ public class H264Renderer {
             }
 
             // Full restart needed (codec not running or setOutputSurface failed)
-            stop();
+            stopInternal();
             this.surface = newSurface;
             start();
 
@@ -1104,7 +1110,6 @@ public class H264Renderer {
         // The only real work: memcpy into pre-allocated buffer
         System.arraycopy(data, offset, wf.data, 0, length);
         wf.length = length;
-        wf.timestamp = 0;  // PTS computed at decode time from elapsed clock
 
         // FIFO enqueue — feeder thread drains in order
         if (stagingOffer(wf)) {

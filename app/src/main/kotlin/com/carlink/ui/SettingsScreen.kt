@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SettingsInputComponent
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Usb
+import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.VideoSettings
 import androidx.compose.material.icons.filled.WebAsset
 import androidx.compose.material3.AlertDialog
@@ -398,6 +399,20 @@ private fun ControlTabContent(
                             modifier = Modifier.weight(1f),
                         )
                     }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    ControlButton(
+                        label = "Refresh Media",
+                        icon = Icons.Default.MusicNote,
+                        severity = ButtonSeverity.WARNING,
+                        enabled = isDeviceConnected && !isProcessing,
+                        isProcessing = isProcessing,
+                        onClick = {
+                            logWarn("[UI_ACTION] Refresh Media button clicked", tag = "UI")
+                            carlinkManager.refreshMediaSession()
+                        },
+                    )
 
                     Spacer(modifier = Modifier.height(12.dp))
 

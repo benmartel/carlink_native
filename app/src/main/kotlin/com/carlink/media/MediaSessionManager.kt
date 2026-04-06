@@ -149,6 +149,59 @@ class MediaSessionManager(
     }
 
     /**
+     * Refresh the MediaSession to force AAOS to re-read metadata.
+     *
+     * GM AAOS occasionally stops updating the now-playing display from an existing
+     * MediaSession. This deactivates the session (AAOS sees it disappear), clears
+     * all internal state and metadata, then reactivates it (AAOS re-reads everything).
+     *
+     * We keep the same session instance (same token) because
+     * MediaBrowserServiceCompat.setSessionToken() throws on a second call —
+     * a new session with a new token can't be pushed to the running service.
+     *
+     * The caller should re-push metadata and playback state after calling this.
+     */
+    fun refresh() {
+        synchronized(sessionLock) {
+            val session = mediaSession
+            if (session == null) {
+                log("[MEDIA_SESSION] Refresh requested but session is null — skipping")
+                return
+            }
+
+            log("[MEDIA_SESSION] Refresh requested — deactivating and clearing session")
+
+            try {
+                // Deactivate so AAOS sees the session disappear
+                session.isActive = false
+
+                // Clear metadata — forces AAOS to discard cached state
+                session.setMetadata(
+                    MediaMetadataCompat.Builder()
+                        .putString(MediaMetadataCompat.METADATA_KEY_TITLE, "")
+                        .build(),
+                )
+                session.setPlaybackState(buildPlaybackState(PlaybackStateCompat.STATE_NONE))
+
+                // Invalidate all dedup state so subsequent metadata/playback pushes
+                // go through unconditionally
+                cachedAlbumArtHash = 0
+                cachedBitmap = null
+                lastPushedPlaying = null
+                lastPushedPositionMs = 0L
+                lastPushedTimeNanos = 0L
+
+                // Reactivate — AAOS re-binds and reads fresh metadata
+                session.isActive = true
+
+                log("[MEDIA_SESSION] Refresh complete — session reactivated")
+            } catch (e: Exception) {
+                log("[MEDIA_SESSION] Error during refresh: ${e.message}")
+            }
+        }
+    }
+
+    /**
      * Release the MediaSession.
      *
      * Call this during plugin detachment.

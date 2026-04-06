@@ -810,8 +810,8 @@ class MainActivity : ComponentActivity() {
  * ARCHITECTURE: Uses overlay/stack pattern instead of screen replacement.
  * MainScreen stays composed when SettingsScreen is pushed on top.
  *
- * WHY: The VideoSurface in MainScreen uses a TextureView with SurfaceTexture.
- * When MainScreen is replaced (disposed), the SurfaceTexture is destroyed,
+ * WHY: The VideoSurface in MainScreen uses a SurfaceView.
+ * When MainScreen is replaced (disposed), the Surface is destroyed,
  * causing "BufferQueue has been abandoned" errors if the MediaCodec is still
  * running. By keeping MainScreen always in composition and overlaying
  * SettingsScreen on top, the video continues playing uninterrupted.
@@ -852,7 +852,7 @@ fun CarlinkApp(
 
     Box(modifier = Modifier.fillMaxSize()) {
         // MainScreen is ALWAYS in composition - VideoSurface never gets disposed
-        // This keeps the SurfaceTexture alive and video playing uninterrupted
+        // This keeps the Surface alive and video playing uninterrupted
         MainScreen(
             carlinkManager = carlinkManager,
             displayMode = displayMode,

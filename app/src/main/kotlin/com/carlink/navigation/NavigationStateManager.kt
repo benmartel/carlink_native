@@ -129,8 +129,8 @@ object NavigationStateManager {
 
             if (isAccessible) {
                 logInfo(
-                    "[NAVI_ICON] Cluster icon provider available via ${providerInfo?.packageName} " +
-                        "(exported=${providerInfo?.exported}) — AA maneuver bitmaps enabled",
+                    "[NAVI_ICON] Cluster icon provider available via ${providerInfo.packageName} " +
+                        "(exported=${providerInfo.exported}) — AA maneuver bitmaps enabled",
                     tag = Logger.Tags.NAVI,
                 )
             } else {

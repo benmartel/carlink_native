@@ -67,7 +67,7 @@ class AudioRingBuffer(
     ): Int {
         var available = availableForWrite()
 
-        // Overwrite-oldest: discard oldest data when full (Session 4 overflow=568 fix)
+        // Overwrite-oldest: discard oldest data when full (prevents buffer-full stalls)
         // Align discard to PCM frame boundary to prevent audio corruption
         // (channel phase shift, clicking/popping artifacts)
         // NOTE: Advancing readPos from the writer violates strict SPSC — if the reader
