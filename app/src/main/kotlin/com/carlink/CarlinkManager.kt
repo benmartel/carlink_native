@@ -1111,40 +1111,6 @@ class CarlinkManager(
     }
 
     /**
-     * Refresh the MediaSession to force GM AAOS to re-read metadata.
-     *
-     * GM AAOS occasionally stops updating the now-playing display from an existing
-     * MediaSession. This deactivates/reactivates the session (forces AAOS to re-bind)
-     * and re-pushes all cached metadata and playback state.
-     */
-    fun refreshMediaSession() {
-        val manager = mediaSessionManager
-        if (manager == null) {
-            logWarn("[DEVICE_OPS] Cannot refresh MediaSession — not initialized (Bluetooth audio mode?)", tag = Logger.Tags.ADAPTR)
-            return
-        }
-
-        logInfo("[DEVICE_OPS] Refreshing MediaSession", tag = Logger.Tags.ADAPTR)
-
-        // Deactivate/reactivate session — invalidates dedup state internally
-        manager.refresh()
-
-        // Re-push all cached metadata to the fresh session
-        manager.updateMetadata(
-            title = lastMediaSongName,
-            artist = lastMediaArtistName,
-            album = lastMediaAlbumName,
-            appName = lastMediaAppName,
-            albumArt = lastAlbumCover,
-            duration = lastDuration,
-        )
-        manager.updatePlaybackState(playing = lastIsPlaying, position = lastPosition)
-        CarlinkMediaBrowserService.updateNowPlaying(lastMediaSongName, lastMediaArtistName)
-
-        logInfo("[DEVICE_OPS] MediaSession refresh completed", tag = Logger.Tags.ADAPTR)
-    }
-
-    /**
      * Handle Surface destruction - pause codec IMMEDIATELY.
      *
      * CRITICAL: This is called when SurfaceView's Surface is destroyed, which happens
@@ -1254,6 +1220,7 @@ class CarlinkManager(
      */
     fun pauseVideo() {
         logInfo("[LIFECYCLE] Pausing video for background", tag = Logger.Tags.VIDEO)
+        cancelDelayedKeyframe()
         h264Renderer?.stop()
     }
 
@@ -1286,9 +1253,16 @@ class CarlinkManager(
         // Pass current surface to resume
         h264Renderer?.resume(surface)
 
-        // Also request keyframe through adapter if connected
+        // Request keyframe so video recovers immediately after background
         if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-            adapterDriver?.sendCommand(CommandMapping.FRAME)
+            if (currentPhoneType == PhoneType.ANDROID_AUTO) {
+                // AA: single keyframe request (periodic FRAME commands reset phone UI)
+                val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                logInfo("[LIFECYCLE] AA resume keyframe sent=$sent", tag = Logger.Tags.VIDEO)
+            } else {
+                // CarPlay: restart the periodic keyframe timer (2.5s initial + 30s periodic)
+                scheduleDelayedKeyframe()
+            }
         }
     }
 

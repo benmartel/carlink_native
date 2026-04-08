@@ -15,7 +15,7 @@ android {
         applicationId = "zeno.carlink"
         minSdk = 32
         targetSdk = 36
-        versionCode = 105
+        versionCode = 106
         versionName = "1.0.0"
 
 //###############################################

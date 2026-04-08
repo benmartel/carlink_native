@@ -59,7 +59,7 @@ public class H264Renderer {
     private int height;
     private Surface surface;
     private volatile boolean running = false;
-    private volatile boolean stopped = false;     // Permanent shutdown — prevents timer resurrection
+    private volatile boolean stopped = false;     // Shutdown flag — prevents timer resurrection; cleared on resume()
     private volatile java.util.Timer retryTimer;  // Stored for cancellation in stop()
     private final LogCallback logCallback;
     private KeyframeRequestCallback keyframeCallback;
@@ -473,6 +473,7 @@ public class H264Renderer {
             // Full restart needed (codec not running or setOutputSurface failed)
             stopInternal();
             this.surface = newSurface;
+            stopped = false;  // Clear shutdown flag — resume is an intentional restart
             start();
 
             // AA: replay cached frames through fresh decoder for faster recovery
