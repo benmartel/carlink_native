@@ -111,9 +111,6 @@ fun AdapterConfigurationDialog(
     val savedWifiBand by adapterConfigPreference.wifiBandFlow.collectAsStateWithLifecycle(
         initialValue = WiFiBandConfig.DEFAULT,
     )
-    val savedCallQuality by adapterConfigPreference.callQualityFlow.collectAsStateWithLifecycle(
-        initialValue = CallQualityConfig.DEFAULT,
-    )
     val savedMediaDelay by adapterConfigPreference.mediaDelayFlow.collectAsStateWithLifecycle(
         initialValue = MediaDelayConfig.DEFAULT,
     )
@@ -202,7 +199,6 @@ fun AdapterConfigurationDialog(
     var selectedAudioSource by remember { mutableStateOf(savedAudioSource) }
     var selectedMicSource by remember { mutableStateOf(savedMicSource) }
     var selectedWifiBand by remember { mutableStateOf(savedWifiBand) }
-    var selectedCallQuality by remember { mutableStateOf(savedCallQuality) }
     var selectedMediaDelay by remember { mutableStateOf(savedMediaDelay) }
     var selectedVideoResolution by remember { mutableStateOf(savedVideoResolution) }
     var selectedFps by remember { mutableStateOf(savedFps) }
@@ -214,7 +210,6 @@ fun AdapterConfigurationDialog(
     LaunchedEffect(savedAudioSource) { selectedAudioSource = savedAudioSource }
     LaunchedEffect(savedMicSource) { selectedMicSource = savedMicSource }
     LaunchedEffect(savedWifiBand) { selectedWifiBand = savedWifiBand }
-    LaunchedEffect(savedCallQuality) { selectedCallQuality = savedCallQuality }
     LaunchedEffect(savedMediaDelay) { selectedMediaDelay = savedMediaDelay }
     LaunchedEffect(savedVideoResolution) { selectedVideoResolution = savedVideoResolution }
     LaunchedEffect(savedFps) { selectedFps = savedFps }
@@ -228,7 +223,6 @@ fun AdapterConfigurationDialog(
         selectedAudioSource != savedAudioSource ||
             selectedMicSource != savedMicSource ||
             selectedWifiBand != savedWifiBand ||
-            selectedCallQuality != savedCallQuality ||
             selectedMediaDelay != savedMediaDelay ||
             selectedVideoResolution != savedVideoResolution ||
             selectedFps != savedFps ||
@@ -397,50 +391,8 @@ fun AdapterConfigurationDialog(
                                 )
                             }
 
-                            // Call Quality Configuration
-                            ConfigurationOptionCard(
-                                title = "Call Quality",
-                                description = "Audio quality for phone calls",
-                                icon = Icons.Default.Call,
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    AudioSourceButton(
-                                        label = "Normal",
-                                        icon = Icons.Default.Phone,
-                                        isSelected = selectedCallQuality == CallQualityConfig.NORMAL,
-                                        onClick = { selectedCallQuality = CallQualityConfig.NORMAL },
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    AudioSourceButton(
-                                        label = "Clear",
-                                        icon = Icons.Default.PhoneInTalk,
-                                        isSelected = selectedCallQuality == CallQualityConfig.CLEAR,
-                                        onClick = { selectedCallQuality = CallQualityConfig.CLEAR },
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    AudioSourceButton(
-                                        label = "HD",
-                                        icon = Icons.Default.Hd,
-                                        isSelected = selectedCallQuality == CallQualityConfig.HD,
-                                        onClick = { selectedCallQuality = CallQualityConfig.HD },
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    text =
-                                        when (selectedCallQuality) {
-                                            CallQualityConfig.NORMAL -> "Standard call quality"
-                                            CallQualityConfig.CLEAR -> "Enhanced clarity"
-                                            CallQualityConfig.HD -> "Highest quality audio"
-                                        },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = colorScheme.primary,
-                                )
-                            }
+                            // Call Quality removed — firmware bug: CMD_BOX_INFO callQuality transform broken,
+                            // value 2 (24kHz) breaks adapter mic input buffer. Hardcoded to 1 in BoxSettings.
 
                             // Media Delay Configuration
                             ConfigurationOptionCard(
@@ -888,7 +840,7 @@ fun AdapterConfigurationDialog(
                                     " - audio=$selectedAudioSource" +
                                     ", mic=$selectedMicSource" +
                                     ", wifi=$selectedWifiBand" +
-                                    ", callQuality=$selectedCallQuality" +
+                                    ", callQuality=1(hardcoded)" +
                                     ", mediaDelay=$selectedMediaDelay" +
                                     ", resolution=${selectedVideoResolution.toStorageString()}" +
                                     ", fps=${selectedFps.fps}" +
@@ -903,7 +855,6 @@ fun AdapterConfigurationDialog(
                                 adapterConfigPreference.setAudioSource(selectedAudioSource)
                                 adapterConfigPreference.setMicSource(selectedMicSource)
                                 adapterConfigPreference.setWifiBand(selectedWifiBand)
-                                adapterConfigPreference.setCallQuality(selectedCallQuality)
                                 adapterConfigPreference.setMediaDelay(selectedMediaDelay)
                                 adapterConfigPreference.setVideoResolution(selectedVideoResolution)
                                 adapterConfigPreference.setFps(selectedFps)

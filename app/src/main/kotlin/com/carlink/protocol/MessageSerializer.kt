@@ -359,9 +359,16 @@ object MessageSerializer {
                 put("androidAutoSizeW", aaWidth)
                 put("androidAutoSizeH", aaHeight)
                 put("mediaSound", 1) // 48kHz only
-                put("callQuality", config.callQuality) // 0=normal, 1=clear, 2=HD
-                put("WiFiChannel", 36) // 5GHz channel 36
-                put("wifiChannel", 36) // Both keys for compatibility
+                // Hardcoded to 1 (16kHz WB). Firmware bug: CMD_BOX_INFO callQuality transform
+                // to VoiceQuality is broken, but value may still be partially persisted.
+                // Value 2 (24kHz) breaks adapter's AirPlay mic input buffer (640B hardcoded for 16kHz).
+                // Always send 1 to prevent stale/tampered values from causing mic failures.
+                // riddleBoxCfg keys are PascalCase; CMD_BOX_INFO JSON uses camelCase.
+                // Firmware maps camelCase→PascalCase internally. Send both quality keys
+                // to ensure both CallQuality (phone mic) and VoiceQuality (Siri mic) stay safe.
+                put("CallQuality", 1)
+                put("VoiceQuality", 1)
+                put("WiFiChannel", 36) // 5GHz channel 36 — hardcoded handler (capital W) triggers wifi restart
                 // DashboardInfo bitmask: bit 0=MediaPlayer, bit 1=LocationEngine, bit 2=RouteGuidance
                 // 7 = all engines enabled. Adapter forwards all data; app decides what to use.
                 put("DashboardInfo", 7)
@@ -372,7 +379,8 @@ object MessageSerializer {
                 put("wifiName", config.boxName)
                 put("btName", config.boxName)
                 put("boxName", config.boxName)
-                put("OemName", config.boxName)
+                // OemName removed — persists to dead storage in riddle.conf; actual OEM name
+                // comes from /etc/airplay.conf (oemIconLabel), which the app writes separately.
                 put("autoConn", true) // Auto-connect when device detected
                 put("autoPlay", false) // Don't auto-play media on connection
             }

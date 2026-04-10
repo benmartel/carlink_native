@@ -30,6 +30,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DisplaySettings
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
@@ -188,13 +189,56 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.weight(1f))
                 }
 
-                // App version at bottom - always visible after NavigationRail
-                Row(
-                    modifier = Modifier.padding(20.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                // Close app button + version at bottom
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
+                    var showCloseConfirm by remember { mutableStateOf(false) }
+
+                    FilledTonalIconButton(
+                        onClick = {
+                            view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                            showCloseConfirm = true
+                        },
+                        modifier = Modifier.size(AutomotiveDimens.ButtonMinHeight),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Close App",
+                            modifier = Modifier.size(AutomotiveDimens.IconSize),
+                            tint = colorScheme.error,
+                        )
+                    }
+
+                    if (showCloseConfirm) {
+                        AlertDialog(
+                            onDismissRequest = { showCloseConfirm = false },
+                            title = { Text("Close App?") },
+                            text = { Text("This will stop all connections and close the app.") },
+                            confirmButton = {
+                                TextButton(
+                                    onClick = {
+                                        logWarn("[UI_ACTION] Close App confirmed", tag = "UI")
+                                        (context as? android.app.Activity)?.finishAffinity()
+                                        android.os.Process.killProcess(android.os.Process.myPid())
+                                    },
+                                ) {
+                                    Text("Close", color = colorScheme.error)
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { showCloseConfirm = false }) {
+                                    Text("Cancel")
+                                }
+                            },
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
                     Text(
-                        text = "Version: ",
+                        text = "Version:",
                         style = MaterialTheme.typography.bodySmall,
                         color = colorScheme.onSurfaceVariant,
                     )

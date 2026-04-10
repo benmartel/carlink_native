@@ -1890,6 +1890,10 @@ class CarlinkManager(
 
             AudioCommand.AUDIO_MEDIA_START -> {
                 logDebug("[AUDIO_CMD] Media audio START command received", tag = Logger.Tags.AUDIO)
+                // Adapter signals media resuming — clear any residual adapter ducking from
+                // a previous voice session (Siri/phone call). The adapter does not send an
+                // explicit volume=1.0 restore packet; MEDIA_START is the session boundary.
+                audioManager?.setDucking(1.0f)
                 setPurpose(StreamPurpose.MEDIA, command)
             }
 

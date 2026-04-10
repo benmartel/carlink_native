@@ -86,7 +86,7 @@ class DualStreamAudioManager(
     private var mediaVolume: Float = 1.0f
     private var navVolume: Float = 1.0f
     private var isDucked: Boolean = false
-    private var duckLevel: Float = 0.2f
+    private var duckLevel: Float = 1.0f // 1.0 = no duck; adapter sets lower via volumeDuration packets
 
     // AudioFocus state machine
     private val activeFocusRequests = mutableMapOf<StreamPurpose, AudioFocusRequest>()
@@ -460,14 +460,17 @@ class DualStreamAudioManager(
         }
     }
 
-    /** Combine adapter ducking and system focus ducking, apply to media slot only. */
+    /** Combine adapter ducking and system focus ducking, apply to media slot only.
+     *  Adapter duck (duckLevel) only applies when explicitly set via volumeDuration packet (isDucked=true).
+     *  System focus duck (focusDuckLevel) always applies — it tracks Android AudioFocus state. */
     private fun applyEffectiveVolume() {
-        val effectiveVolume = mediaVolume * minOf(duckLevel, focusDuckLevel)
+        val adapterFactor = if (isDucked) duckLevel else 1.0f
+        val effectiveVolume = mediaVolume * minOf(adapterFactor, focusDuckLevel)
         mediaSlot?.track?.setVolume(effectiveVolume)
         // Non-media purpose slots (PHONE_CALL, SIRI, ALERT) stay at full volume
         logDebug(
             "[AUDIO_FOCUS] Volume: effective=${(effectiveVolume * 100).toInt()}% " +
-                "(media=${(mediaVolume * 100).toInt()}% adapterDuck=${(duckLevel * 100).toInt()}% " +
+                "(media=${(mediaVolume * 100).toInt()}% adapterDuck=${if (isDucked) "${(duckLevel * 100).toInt()}%" else "off"} " +
                 "focusDuck=${(focusDuckLevel * 100).toInt()}%)",
         )
     }
@@ -887,7 +890,7 @@ class DualStreamAudioManager(
             val volume =
                 when (purpose) {
                     StreamPurpose.NAVIGATION -> navVolume
-                    StreamPurpose.MEDIA -> if (isDucked) mediaVolume * minOf(duckLevel, focusDuckLevel) else mediaVolume
+                    StreamPurpose.MEDIA -> mediaVolume * minOf(if (isDucked) duckLevel else 1.0f, focusDuckLevel)
                     else -> 1.0f // Non-media purpose slots stay at full volume
                 }
             track.setVolume(volume)
