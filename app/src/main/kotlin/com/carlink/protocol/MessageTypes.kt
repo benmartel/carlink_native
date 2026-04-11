@@ -318,6 +318,7 @@ enum class AudioCommand(
     AUDIO_ALERT_START(12),
     AUDIO_ALERT_STOP(13),
     AUDIO_INCOMING_CALL_INIT(14),
+    AUDIO_TBT_START(15),
     AUDIO_NAVI_COMPLETE(16),
     UNKNOWN(-1),
     ;
@@ -427,6 +428,7 @@ enum class MediaType(
     DATA(1),
     ALBUM_COVER_AA(2), // Android Auto album art — PNG at offset +4 (subtype 2)
     ALBUM_COVER(3),    // CarPlay album art — JPEG at offset +4 (subtype 3)
+    CALL_STATUS(100),  // iAP2 CallStateEngine — JSON: CallStatus/CallDirection/CallID/CallName/CallNumber
     NAVI_JSON(200),
     NAVI_IMAGE(201),
     UNKNOWN(-1),

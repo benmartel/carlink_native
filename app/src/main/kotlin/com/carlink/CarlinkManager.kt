@@ -1830,11 +1830,15 @@ class CarlinkManager(
         )
 
         when (command) {
+            AudioCommand.AUDIO_TBT_START,
             AudioCommand.AUDIO_NAVI_START -> {
-                logInfo("[AUDIO_CMD] Navigation audio START command received", tag = Logger.Tags.AUDIO)
-                // Reset navStopped so writeAudio() accepts packets (NAVI_COMPLETE may never arrive)
+                // TBT_START (byte 15) and NAVI_START (byte 6) both start nav audio.
+                // TBT_START arrives ~97ms before NAVI_START in turn-by-turn sequences.
+                // Whichever arrives first prepares the nav path; the second is a no-op
+                // since onNavStarted() is idempotent.
+                val cmdName = if (command == AudioCommand.AUDIO_TBT_START) "TBT_START" else "NAVI_START"
+                logInfo("[AUDIO_CMD] Navigation audio START ($cmdName)", tag = Logger.Tags.AUDIO)
                 audioManager?.onNavStarted()
-                // Nav track is created on first packet; nav focus is requested in ensureNavTrack()
             }
 
             AudioCommand.AUDIO_NAVI_STOP -> {
@@ -2088,6 +2092,35 @@ class CarlinkManager(
                     duration = lastDuration,
                 )
             }
+            return
+        }
+
+        // CallStatus JSON (subtype 100) — iAP2 CallStateEngine forwarding.
+        // Log at INFO for release troubleshooting. Not consumed for UI — CarPlay/AA
+        // projection already shows call screen, and cluster requires system privilege.
+        if (message.type == MediaType.CALL_STATUS) {
+            val status = message.payload["CallStatus"] as? Int ?: -1
+            val direction = message.payload["CallDirection"] as? Int
+            val name = message.payload["CallName"] as? String
+            val number = message.payload["CallNumber"] as? String
+            val statusName = when (status) {
+                0 -> "idle"
+                1 -> "dialing"
+                2 -> "ringing"
+                3 -> "connected"
+                4 -> "disconnecting"
+                else -> "?$status"
+            }
+            val dirName = when (direction) {
+                1 -> "incoming"
+                2 -> "outgoing"
+                else -> ""
+            }
+            val caller = name ?: number ?: ""
+            logInfo(
+                "[CALL_STATUS] $statusName $dirName${if (caller.isNotEmpty()) " caller=$caller" else ""}",
+                tag = Logger.Tags.PHONE,
+            )
             return
         }
 

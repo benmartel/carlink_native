@@ -255,7 +255,7 @@ object MessageParser {
                     }
                 }
 
-                MediaType.DATA, MediaType.NAVI_JSON -> {
+                MediaType.DATA, MediaType.NAVI_JSON, MediaType.CALL_STATUS -> {
                     if (header.length < 6) {
                         // Need at least: 4 (type int) + 1 (JSON byte) + 1 (trailing null)
                         emptyMap()

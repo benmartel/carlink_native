@@ -320,3 +320,7 @@
    - Media silent after phone call: Removed setPurpose(RINGTONE) from INCOMING_CALL_INIT (no protocol STOP exists, focus was never abandoned). Added endPurpose(RINGTONE) safety nets in PHONECALL_START, ALERT_STOP, MEDIA_START.
    - "Waiting for phone" after force-kill: Send 0x0F+0x15 after USB open in CarlinkManager.start() to clear stale adapter session. Fixed Close App button: added stop() before finishAffinity(), removed killProcess().
    - Ringtone silent during incoming call: ALERT routing now matches on isAlertActive only, dropped 24kHz/mono format check. 48kHz stereo alert audio was falling through to muted MEDIA slot. ensureSlotFormat() recreates ALERT track to match incoming format.
+
+[111] :: Documentation Corrections and Unknown firmware messages documented.
+   - 0x0F Turn-by-Turn Start arrives before NAVI_START. Used as an additional trigger for Nav Audio start before actual audio packets.
+   - 0x2A DashboardInfo also contains Call information as JSON sub type 100. In/Outgoing Call information rcvd by adapter. Not implemented (sys perm restricted).

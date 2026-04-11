@@ -1,6 +1,8 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("org.jlleitschuh.gradle.ktlint")
+    id("io.gitlab.arturbosch.detekt")
 }
 
 android {
@@ -15,7 +17,7 @@ android {
         applicationId = "zeno.carlink"
         minSdk = 32
         targetSdk = 36
-        versionCode = 110
+        versionCode = 111
         versionName = "1.0.0"
 
 //###############################################
@@ -64,6 +66,28 @@ android {
         disable += "Instantiatable"  // CarAppActivity from app-automotive AAR — false positive
         disable += "InvalidUsesTagAttribute"  // "navigation" is valid for Car App Library nav apps
     }
+}
+
+// Kotlin compiler: report deprecations and unchecked casts as warnings
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    compilerOptions {
+        freeCompilerArgs.addAll("-opt-in=kotlin.RequiresOptIn")
+        allWarningsAsErrors.set(false) // report but don't fail — tighten later
+    }
+}
+
+ktlint {
+    android.set(true)
+    outputToConsole.set(true)
+    ignoreFailures.set(true) // report only on first run — fix incrementally
+}
+
+detekt {
+    buildUponDefaultConfig = true
+    allRules = false
+    config.setFrom(files("$rootDir/detekt.yml"))
+    baseline = file("$rootDir/detekt-baseline.xml")
+    ignoreFailures = true // report only on first run
 }
 
 dependencies {
