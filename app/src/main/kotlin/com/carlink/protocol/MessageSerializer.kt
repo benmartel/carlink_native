@@ -394,6 +394,7 @@ object MessageSerializer {
      * oemIconLabel is always "Exit" regardless of box settings.
      * Uses explicit \n (not raw multiline string)
      */
+    @Suppress("detekt:UnusedParameter") // config reserved for future per-adapter OEM icon customization
     fun generateAirplayConfig(config: AdapterConfig): String =
         "oemIconVisible = 1\nname = AutoBox\n" +
             "model = Magic-Car-Link-1.00\n" +

@@ -320,3 +320,42 @@
    - Media silent after phone call: Removed setPurpose(RINGTONE) from INCOMING_CALL_INIT (no protocol STOP exists, focus was never abandoned). Added endPurpose(RINGTONE) safety nets in PHONECALL_START, ALERT_STOP, MEDIA_START.
    - "Waiting for phone" after force-kill: Send 0x0F+0x15 after USB open in CarlinkManager.start() to clear stale adapter session. Fixed Close App button: added stop() before finishAffinity(), removed killProcess().
    - Ringtone silent during incoming call: ALERT routing now matches on isAlertActive only, dropped 24kHz/mono format check. 48kHz stereo alert audio was falling through to muted MEDIA slot. ensureSlotFormat() recreates ALERT track to match incoming format.
+
+[111] :: Documentation Corrections and Unknown firmware messages documented.
+   - 0x0F Turn-by-Turn Start arrives before NAVI_START. Used as an additional trigger for Nav Audio start before actual audio packets.
+   - 0x2A DashboardInfo also contains Call information as JSON sub type 100. In/Outgoing Call information rcvd by adapter. Not implemented (sys perm restricted).
+
+[112] :: MediaSession rework, Maybe fix inconsistent GM AAOS. AUDIO_ROUTE log cleanup.
+   - automotive_app_desc.xml: added <uses name="media"/> so AAOS enumerates the app as a media source
+   - CarlinkMediaBrowserService: typed ServiceCompat.startForeground(MEDIA_PLAYBACK|CONNECTED_DEVICE) for Android 14+ compliance
+   - MessageParser: safeWrap() clamps header.length to payload.size — truncated USB frames no longer crash the read loop
+   - MessageParser: JSON media branch uses trimEnd('\u0000') instead of hardcoded -5 (firmware variants omit trailing NUL)
+   - CarlinkManager.processMediaMetadata: dedup predicate now includes artist/album/appName/duration so AA's split incremental metadata (title-then-artist) isn't dropped
+   - Album art: new AlbumArtCache writes downscaled JPEGs to a FileProvider-backed cache. Inline METADATA_KEY_ALBUM_ART Bitmap is PRIMARY; ALBUM_ART_URI/ART_URI/DISPLAY_ICON_URI keys additive ONLY after disk write confirmed.
+   - AUDIO_ROUTE only logs on route change (purpose, sample rate, or channel count) with 30-second summaries. Prior: logged on every audio packet.
+
+[113] :: Cold-start inset race fix attempt (SYSTEM_UI_VISIBLE stretch/cutout). Seen on AAOS emulator + VCUNH1. Not on gminfo
+   - themes.xml: dropped windowFullscreen + inline cutout mode.
+   - applyDisplayMode: per-mode setDecorFitsSystemWindows + layoutInDisplayCutoutMode. SystemUI > (true, DEFAULT); immersive modes > (false, ALWAYS).
+   - onCreate: initializeCarlinkManager deferred via decorView.post so WindowMetrics reflects post-clip rect on first read.
+   - MainScreen: VideoSurface wrapped in key(carlinkManager, displayMode) — reinit paths drop the AndroidView slot and release the HWC plane.
+   - Reset Connection: rebuilds manager via reinitializeForDisplayMode(currentDisplayMode) instead of in-place restart().
+   - Verified: SurfaceView 2400x788 on first create (was 2400x864 transient). Tested on Emulator with Display size of 13.2 at 2400x960.
+
+[114] :: MediaSession and Instrument Cluster Code changes. Volume adjust based on type.
+   - MediaSessionManager.kt added/updated URI_GRANT_CONSUMERS list, a helper, and pre-grant publishMetadata.
+   - DualStreamAudioManager.kt stop Phone Call track from pausing on perceived idle time. Prevents GM AAOS from flipping between vgroup 1 (Phone Call) and vgroup 3 (Media) during an active Phone Call volume adjust.
+
+[115] :: Testing and troubleshooting Volume Adjust based on type. DualStreamAudioManager.kt
+   - pause + flush the phoneCallSlot AudioTrack and reset slot state. Mirrors stopNavTrack() 
+   - AUDIO_PHONECALL_STOP branch — call stopPhoneCallTrack() before endPurpose() so the track leaves PLAYSTATE_PLAYING before focus is abandoned
+   - added SIRI to the silence-write branch (no more mid-prompt idle-pause flap).
+   - new stopSiriTrack() mirroring stopPhoneCallTrack()
+   - AUDIO_SIRI_STOP branch — calls audioManager?.stopSiriTrack() unconditionally before the branch split, so the USAGE_ASSISTANT player signal is released whether or not a phone call is taking over
+
+[116] :: Troubleshooting Alert Routing for Volume Control
+   - MediaSessionManager.kt setPlaybackToLocal(STREAM_MUSIC) in initialize() so the default routing target is documented (rather than implicit). new setRingtoneRouting() (> STREAM_RING > USAGE_NOTIFICATION_RINGTONE) and setMediaRouting() ( > STREAM_MUSIC) methods
+   - CarlinkManager.kt AUDIO_ALERT_START calls setRingtoneRouting() before setPurpose(ALERT), and AUDIO_ALERT_STOP calls setMediaRouting() before endPurpose(ALERT).
+
+{117} :: Revert 116 changes. Blocked Voice Assistant Volume adjust without improving ringtone control.
+   - DualStreamAudioManager.kt Attempting to use GM AAOS vgroup2 BUS_CALL_RING, without Telecomm code.

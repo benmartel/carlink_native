@@ -148,6 +148,12 @@ class DualStreamAudioManager(
     private val underrunRecoveryThreshold = 10
     private val minBufferLevelMs = 0 // AudioTrack internal buffer (4x min) provides jitter protection
 
+    // AUDIO_ROUTE dedup: only log when route changes, plus periodic summary
+    private var lastRoutePurpose: StreamPurpose? = null
+    private var lastRouteSampleRate: Int = 0
+    private var lastRouteChannels: Int = 0
+    private var routeRepeatCount: Long = 0
+
     @Volatile private var navStarted = false
 
     @Volatile private var navStartTime: Long = 0
@@ -547,8 +553,16 @@ class DualStreamAudioManager(
             StreamPurpose.MEDIA -> Pair(AudioAttributes.USAGE_MEDIA, AudioAttributes.CONTENT_TYPE_MUSIC)
             StreamPurpose.PHONE_CALL -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION, AudioAttributes.CONTENT_TYPE_SPEECH)
             StreamPurpose.SIRI -> Pair(AudioAttributes.USAGE_ASSISTANT, AudioAttributes.CONTENT_TYPE_SPEECH)
-            StreamPurpose.ALERT -> Pair(AudioAttributes.USAGE_NOTIFICATION_RINGTONE, AudioAttributes.CONTENT_TYPE_MUSIC)
-            StreamPurpose.RINGTONE -> Pair(AudioAttributes.USAGE_NOTIFICATION_RINGTONE, AudioAttributes.CONTENT_TYPE_MUSIC)
+            // ALERT (incoming-call ringtone): try USAGE_VOICE_COMMUNICATION_SIGNALLING
+            // to attempt routing onto BUS_CALL_RING → vgroup 2 (RING) on GM AAOS.
+            // Standard AOSP maps USAGE_NOTIFICATION_RINGTONE to CALL_RING context, but
+            // GM's carAudioContexts.xml on this head unit remaps it to BUS_NOTIFICATION
+            // (vgroup 6 SYSTEM) — not adjustable, not on the right physical bus.
+            // SIGNALLING is the closest usage that semantically belongs to the telephony
+            // group and may map to BUS_CALL_RING in GM's config without requiring a
+            // Telecom ConnectionService. Fallback: USAGE_NOTIFICATION_RINGTONE.
+            StreamPurpose.ALERT -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING, AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            StreamPurpose.RINGTONE -> Pair(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING, AudioAttributes.CONTENT_TYPE_SONIFICATION)
             StreamPurpose.NAVIGATION -> Pair(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE, AudioAttributes.CONTENT_TYPE_SPEECH)
         }
 
@@ -642,6 +656,82 @@ class DualStreamAudioManager(
 
     private var navPackets: Long = 0
 
+    /**
+     * Pause the SIRI track on AUDIO_SIRI_STOP. Same rationale as stopPhoneCallTrack:
+     * SIRI now writes silence on idle gaps (TTS inter-utterance pauses) to prevent
+     * mid-session volume-context flap, so it needs an explicit pause at end-of-session
+     * to release the USAGE_ASSISTANT active-player signal back to AAOS.
+     */
+    fun stopSiriTrack() {
+        log("[SIRI_STOP] stopSiriTrack() called")
+        synchronized(lock) {
+            val slot = siriSlot ?: run {
+                log("[SIRI_STOP] siriSlot is null, nothing to stop")
+                return
+            }
+            slot.track?.let { track ->
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    try {
+                        track.pause()
+                        track.flush()
+                    } catch (e: Exception) {
+                        log("[SIRI_STOP] pause/flush failed: ${e.message}")
+                    }
+                    log("[SIRI_STOP] SIRI track paused+flushed")
+                } else {
+                    log("[SIRI_STOP] Track not playing (state=${track.playState}), skipping pause")
+                }
+            }
+            slot.started = false
+            slot.idleSince = 0
+            slot.residualOffset = 0
+            slot.residualCount = 0
+            slot.buffer.clear()
+        }
+    }
+
+    /**
+     * Pause the phone-call track on AUDIO_PHONECALL_STOP.
+     *
+     * Required because the idle-pause path no longer pauses PHONE_CALL — it writes
+     * silence to keep the track PLAYING across natural inter-packet gaps (VAD/silence
+     * frames). Without an explicit pause at end-of-call, the AudioTrack stays in
+     * PLAYSTATE_PLAYING with USAGE_VOICE_COMMUNICATION and AAOS keeps routing volume
+     * keys to the CALL group while ducking MEDIA/SIRI to inaudibility — symptom is
+     * "post-call silence: media plays internally but nothing is heard, volume stuck
+     * on call group." NAV breaks through via its own focus request, but on NAV end
+     * the system falls back to the still-playing PHONE_CALL track.
+     *
+     * Mirrors stopNavTrack() — pause + flush + reset slot state.
+     */
+    fun stopPhoneCallTrack() {
+        log("[PHONECALL_STOP] stopPhoneCallTrack() called")
+        synchronized(lock) {
+            val slot = phoneCallSlot ?: run {
+                log("[PHONECALL_STOP] phoneCallSlot is null, nothing to stop")
+                return
+            }
+            slot.track?.let { track ->
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    try {
+                        track.pause()
+                        track.flush()
+                    } catch (e: Exception) {
+                        log("[PHONECALL_STOP] pause/flush failed: ${e.message}")
+                    }
+                    log("[PHONECALL_STOP] Phone-call track paused+flushed")
+                } else {
+                    log("[PHONECALL_STOP] Track not playing (state=${track.playState}), skipping pause")
+                }
+            }
+            slot.started = false
+            slot.idleSince = 0
+            slot.residualOffset = 0
+            slot.residualCount = 0
+            slot.buffer.clear()
+        }
+    }
+
     /** Stop playback and release all resources. */
     fun release() {
         synchronized(lock) {
@@ -731,11 +821,23 @@ class DualStreamAudioManager(
             } else {
                 mediaSlot // Default: all other audio (including transition-period media)
             }
-        logDebug(
-            "[AUDIO_ROUTE] ${format.sampleRate}Hz/${format.channelCount}ch " +
-                "state=(call=${state.isPhoneCallActive} siri=${state.isSiriActive} alert=${state.isAlertActive}) " +
-                "→ ${slot?.purpose ?: "null"}",
-        )
+        val purpose = slot?.purpose
+        if (purpose != lastRoutePurpose || format.sampleRate != lastRouteSampleRate || format.channelCount != lastRouteChannels) {
+            if (routeRepeatCount > 0) {
+                logDebug("[AUDIO_ROUTE] (suppressed $routeRepeatCount identical)")
+            }
+            logDebug(
+                "[AUDIO_ROUTE] ${format.sampleRate}Hz/${format.channelCount}ch " +
+                    "state=(call=${state.isPhoneCallActive} siri=${state.isSiriActive} alert=${state.isAlertActive}) " +
+                    "→ ${purpose ?: "null"}",
+            )
+            lastRoutePurpose = purpose
+            lastRouteSampleRate = format.sampleRate
+            lastRouteChannels = format.channelCount
+            routeRepeatCount = 0
+        } else {
+            routeRepeatCount++
+        }
         return slot
     }
 
@@ -1063,10 +1165,20 @@ class DualStreamAudioManager(
                                 if (slot.idleSince == 0L) {
                                     slot.idleSince = now
                                 } else if (now - slot.idleSince >= idlePauseMs) {
-                                    if (slot.purpose == StreamPurpose.MEDIA) {
-                                        // MEDIA: write silence to keep AudioTrack PLAYING,
-                                        // avoiding AudioFlinger state transitions and
-                                        // AudioPlayerStateMonitor callback floods on AAOS.
+                                    if (slot.purpose == StreamPurpose.MEDIA ||
+                                        slot.purpose == StreamPurpose.PHONE_CALL ||
+                                        slot.purpose == StreamPurpose.SIRI
+                                    ) {
+                                        // MEDIA, PHONE_CALL, SIRI: write silence to keep AudioTrack
+                                        // PLAYING. These streams have natural inter-packet gaps
+                                        // (VAD/silence frames in calls; inter-utterance pauses in
+                                        // Siri/Assistant TTS) that would otherwise trigger
+                                        // pause/resume churn — releasing the volume context to
+                                        // AAOS and causing volume keys to flap to MEDIA mid-session.
+                                        // Their lifecycle is gated by explicit STOP commands
+                                        // (AUDIO_PHONECALL_STOP / AUDIO_SIRI_STOP) which call
+                                        // stopPhoneCallTrack() / stopSiriTrack() to release the
+                                        // volume context — not by buffer drain.
                                         track.write(
                                             silenceBuffer,
                                             0,
@@ -1074,9 +1186,8 @@ class DualStreamAudioManager(
                                             AudioTrack.WRITE_NON_BLOCKING,
                                         )
                                     } else {
-                                        // Non-MEDIA (SIRI, PHONE_CALL, ALERT): pause to
-                                        // release AAOS volume context. These have defined
-                                        // start/end lifecycle signals.
+                                        // ALERT: pause to release AAOS volume context.
+                                        // Short bursts with defined start/end signals.
                                         track.pause()
                                         slot.started = false
                                         slot.idleSince = 0
@@ -1367,6 +1478,9 @@ class DualStreamAudioManager(
                         if (nRes > 0) sb.append(" Res:").append(nRes)
                         sb.append("]")
                         if (zf > 0) sb.append(" Zero:").append(zf)
+                        val suppressed = routeRepeatCount
+                        if (suppressed > 0) sb.append(" Route:").append(lastRoutePurpose?.name ?: "?").append("x").append(suppressed)
+                        routeRepeatCount = 0
                         sb.append(" Duck:").append(if (isDucked) "Y" else "N")
                         sb.append(" FDuck:").append((focusDuckLevel * 100).toInt()).append("%")
                         val focusPurposes = activeFocusRequests.keys.joinToString(",")

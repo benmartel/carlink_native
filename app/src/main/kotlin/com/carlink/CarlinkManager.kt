@@ -1830,11 +1830,15 @@ class CarlinkManager(
         )
 
         when (command) {
+            AudioCommand.AUDIO_TBT_START,
             AudioCommand.AUDIO_NAVI_START -> {
-                logInfo("[AUDIO_CMD] Navigation audio START command received", tag = Logger.Tags.AUDIO)
-                // Reset navStopped so writeAudio() accepts packets (NAVI_COMPLETE may never arrive)
+                // TBT_START (byte 15) and NAVI_START (byte 6) both start nav audio.
+                // TBT_START arrives ~97ms before NAVI_START in turn-by-turn sequences.
+                // Whichever arrives first prepares the nav path; the second is a no-op
+                // since onNavStarted() is idempotent.
+                val cmdName = if (command == AudioCommand.AUDIO_TBT_START) "TBT_START" else "NAVI_START"
+                logInfo("[AUDIO_CMD] Navigation audio START ($cmdName)", tag = Logger.Tags.AUDIO)
                 audioManager?.onNavStarted()
-                // Nav track is created on first packet; nav focus is requested in ensureNavTrack()
             }
 
             AudioCommand.AUDIO_NAVI_STOP -> {
@@ -1873,6 +1877,10 @@ class CarlinkManager(
                 // USB capture shows: PHONECALL_START arrives ~130ms BEFORE SIRI_STOP
                 // Always clear siri routing flag (audio routing is independent of mic lifecycle)
                 isSiriAudioActive = false
+                // Pause SIRI AudioTrack regardless of branch — the silence-write idle
+                // path keeps it PLAYING otherwise, leaving the USAGE_ASSISTANT volume
+                // context active and stealing volume routing from MEDIA after Siri ends.
+                audioManager?.stopSiriTrack()
                 if (activeVoiceMode == VoiceMode.PHONECALL) {
                     logInfo(
                         "[AUDIO_CMD] Siri stopped but phone call active - keeping mic for call",
@@ -1895,6 +1903,11 @@ class CarlinkManager(
                 logInfo("[AUDIO_CMD] Phone call stopped - disabling microphone", tag = Logger.Tags.MIC)
                 activeVoiceMode = VoiceMode.NONE
                 isPhoneCallAudioActive = false
+                // Pause the phone-call AudioTrack BEFORE abandoning focus so AAOS
+                // sees no active USAGE_VOICE_COMMUNICATION player. Without this,
+                // the silence-write idle path keeps the track PLAYING and AAOS
+                // keeps routing volume keys to the CALL group + ducking media.
+                audioManager?.stopPhoneCallTrack()
                 endPurpose(StreamPurpose.PHONE_CALL, command)
                 stopMicrophoneCapture()
             }
@@ -2091,6 +2104,35 @@ class CarlinkManager(
             return
         }
 
+        // CallStatus JSON (subtype 100) — iAP2 CallStateEngine forwarding.
+        // Log at INFO for release troubleshooting. Not consumed for UI — CarPlay/AA
+        // projection already shows call screen, and cluster requires system privilege.
+        if (message.type == MediaType.CALL_STATUS) {
+            val status = message.payload["CallStatus"] as? Int ?: -1
+            val direction = message.payload["CallDirection"] as? Int
+            val name = message.payload["CallName"] as? String
+            val number = message.payload["CallNumber"] as? String
+            val statusName = when (status) {
+                0 -> "idle"
+                1 -> "dialing"
+                2 -> "ringing"
+                3 -> "connected"
+                4 -> "disconnecting"
+                else -> "?$status"
+            }
+            val dirName = when (direction) {
+                1 -> "incoming"
+                2 -> "outgoing"
+                else -> ""
+            }
+            val caller = name ?: number ?: ""
+            logInfo(
+                "[CALL_STATUS] $statusName $dirName${if (caller.isNotEmpty()) " caller=$caller" else ""}",
+                tag = Logger.Tags.PHONE,
+            )
+            return
+        }
+
         // Unknown MediaData subtype — log everything for protocol discovery
         if (message.type == MediaType.UNKNOWN) {
             unknownMediaSubtypeCount++
@@ -2110,13 +2152,28 @@ class CarlinkManager(
         // Extract new song title (if present)
         val newSongName = (payload["MediaSongName"] as? String)?.takeIf { it.isNotEmpty() }
 
-        // Detect song change — clear all cached metadata to prevent stale data mixing
+        // WHY we snapshot previous state before the song-change reset:
+        // Android Auto sends metadata in split increments across consecutive
+        // frames (frame 1: title only; frame 2: artist only; frame 3: album).
+        // The prior metadataChanged predicate compared only title+cover, so
+        // artist/album/appName-only updates were silently dropped — cluster
+        // showed title without artist until the next song change. Capturing
+        // previous* here lets metadataChanged below detect incremental changes
+        // even after lastMediaArtistName/etc. have been overwritten.
         val previousSongName = lastMediaSongName
+        val previousArtist = lastMediaArtistName
+        val previousAlbum = lastMediaAlbumName
+        val previousAppName = lastMediaAppName
+        val previousDuration = lastDuration
+
+        // Detect song change — clear all cached metadata to prevent stale data mixing
         if (newSongName != null && newSongName != previousSongName) {
             lastMediaSongName = null
             lastMediaArtistName = null
             lastMediaAlbumName = null
             lastAlbumCover = null
+            lastDuration = 0L
+            lastPosition = 0L
             // Keep appName - typically doesn't change mid-session
         }
 
@@ -2124,15 +2181,12 @@ class CarlinkManager(
         newSongName?.let {
             lastMediaSongName = it
         }
-        (payload["MediaArtistName"] as? String)?.takeIf { it.isNotEmpty() }?.let {
-            lastMediaArtistName = it
-        }
-        (payload["MediaAlbumName"] as? String)?.takeIf { it.isNotEmpty() }?.let {
-            lastMediaAlbumName = it
-        }
-        (payload["MediaAPPName"] as? String)?.takeIf { it.isNotEmpty() }?.let {
-            lastMediaAppName = it
-        }
+        val newArtist = (payload["MediaArtistName"] as? String)?.takeIf { it.isNotEmpty() }
+        newArtist?.let { lastMediaArtistName = it }
+        val newAlbum = (payload["MediaAlbumName"] as? String)?.takeIf { it.isNotEmpty() }
+        newAlbum?.let { lastMediaAlbumName = it }
+        val newAppName = (payload["MediaAPPName"] as? String)?.takeIf { it.isNotEmpty() }
+        newAppName?.let { lastMediaAppName = it }
 
         // Process album cover after song change detection
         val albumCover = payload["AlbumCover"] as? ByteArray
@@ -2163,11 +2217,17 @@ class CarlinkManager(
                 isPlaying = isPlaying,
             )
 
-        // Detect whether metadata actually changed (song change or new album cover)
-        // Position-only ticks (~95% of messages) skip the expensive metadata path
+        // WHY this broader predicate: AA's incremental metadata stream would
+        // otherwise suppress legitimate artist/album/appName/duration-only
+        // updates. Position-only ticks (~95% of messages) still short-circuit
+        // because none of the guarded fields change between them.
         val metadataChanged =
             (newSongName != null && newSongName != previousSongName) ||
-                albumCover != null
+                (newArtist != null && newArtist != previousArtist) ||
+                (newAlbum != null && newAlbum != previousAlbum) ||
+                (newAppName != null && newAppName != previousAppName) ||
+                albumCover != null ||
+                (duration > 0 && duration != previousDuration)
 
         if (metadataChanged) {
             // Full metadata update (title/artist/album/cover/duration)
