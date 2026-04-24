@@ -87,8 +87,19 @@ import kotlinx.coroutines.launch
  *
  * Structure:
  * - Header with icon and title
- * - Scrollable content with configuration options
- * - Footer with Save/Default/Cancel buttons
+ * - Subtitle ("Changes require app restart…" — see HAZARD note at that string)
+ * - SecondaryTabRow with Audio / Visual / Misc tabs (ephemeral state via remember)
+ * - Scrollable content area whose body switches on the selected tab
+ * - Footer with Cancel / Default / Apply buttons (tiered restart strategy at Apply)
+ *
+ * @param adapterConfigPreference DataStore-backed flows + setters for each config field.
+ * @param carlinkManager Current manager (nullable before connection); used by Tier 3 stop()
+ *   and by Reboot Adapter action.
+ * @param currentDisplayMode Drives usable-width/height calculation for resolution options.
+ * @param onDismiss Invoked on Cancel / Default / Apply completion / outside tap.
+ * @param onReinitAdapter Tier-2 callback. NAME IS MISLEADING: MainActivity implements this
+ *   as `reinitializeForDisplayMode`, i.e. a full CarlinkManager rebuild — not just an
+ *   adapter re-init. See MainActivity for actual behavior.
  */
 @Composable
 fun AdapterConfigurationDialog(
@@ -206,7 +217,12 @@ fun AdapterConfigurationDialog(
     var selectedGpsForwarding by remember { mutableStateOf(savedGpsForwarding) }
     var selectedClusterNavigation by remember { mutableStateOf(savedClusterNavigation) }
 
-    // Sync local state when saved value loads (for initial load)
+    // Sync local state when saved value loads (for initial load).
+    // KNOWN THEORETICAL RACE (flow-shadow): any subsequent DataStore emission for one of these
+    // keys re-runs the LaunchedEffect and OVERWRITES the user's in-flight selectedXxx choice.
+    // Low probability in practice — DataStore only emits when something else writes — but a
+    // concurrent write from elsewhere (e.g. resetToDefaults, external setter) will clobber
+    // edits the user has made in the open dialog. Not fixed here; documented only.
     LaunchedEffect(savedAudioSource) { selectedAudioSource = savedAudioSource }
     LaunchedEffect(savedMicSource) { selectedMicSource = savedMicSource }
     LaunchedEffect(savedWifiBand) { selectedWifiBand = savedWifiBand }
@@ -217,8 +233,11 @@ fun AdapterConfigurationDialog(
     LaunchedEffect(savedGpsForwarding) { selectedGpsForwarding = savedGpsForwarding }
     LaunchedEffect(savedClusterNavigation) { selectedClusterNavigation = savedClusterNavigation }
 
-    // Track if any changes were made
-    // All adapter configuration changes require app restart
+    // Track if any changes were made.
+    // NOTE (stale): the old one-liner here claimed "All adapter configuration changes require
+    // app restart" — that is no longer true. Apply uses a tiered strategy (see Apply block
+    // ~line 828): only Misc changes (GPS/WiFi/ClusterNav) force a Tier-3 app kill; Audio/Visual
+    // changes take the Tier-2 in-place reinit path. See also the misleading subtitle at ~line 273.
     val hasChanges =
         selectedAudioSource != savedAudioSource ||
             selectedMicSource != savedMicSource ||
@@ -268,7 +287,11 @@ fun AdapterConfigurationDialog(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Subtitle - all changes require restart
+                // Subtitle.
+                // HAZARD (stale UX copy — misleading to end users): this string is pending a
+                // product-copy update. Audio/Visual-only changes take the Tier-2 in-place
+                // reinit path (no app restart). Only Misc changes (GPS/WiFi/ClusterNav)
+                // actually restart the app. DO NOT edit the string here without product sign-off.
                 Text(
                     text = "Changes require app restart to apply",
                     style = MaterialTheme.typography.bodyMedium,
@@ -391,8 +414,13 @@ fun AdapterConfigurationDialog(
                                 )
                             }
 
-                            // Call Quality removed — firmware bug: CMD_BOX_INFO callQuality transform broken,
-                            // value 2 (24kHz) breaks adapter mic input buffer. Hardcoded to 1 in BoxSettings.
+                            // Call Quality — UI removed (not the whole feature).
+                            // VESTIGIAL / UI-DEAD: CallQualityConfig enum, setter/getter, ConfigKey,
+                            // MessageSerializer.addChangedSettings branch, and ProGuard keep rule
+                            // all still exist (see AdapterConfigPreference.kt:117-118). The
+                            // firmware bug (CMD_BOX_INFO callQuality transform; value 2 (24kHz)
+                            // breaks adapter mic input buffer) is why it is hardcoded to 1 in
+                            // BoxSettings and why the UI toggle was pulled.
 
                             // Media Delay Configuration
                             ConfigurationOptionCard(
@@ -451,6 +479,16 @@ fun AdapterConfigurationDialog(
                         // ===== Visual Tab =====
                         1 -> {
                             // Video Resolution Configuration
+                            //
+                            // HAZARD — SILENT DROP under Tier 2 (see Apply block):
+                            // MessageSerializer.addChangedSettings has NO branches for
+                            // VIDEO_RESOLUTION or FPS (see AdapterConfigPreference.kt:355-362,
+                            // 375-383). If the user changes ONLY resolution and/or FPS here
+                            // (Visual tab, no Misc changes), Apply takes the Tier-2
+                            // MINIMAL_PLUS_CHANGES path — the new values are persisted to
+                            // DataStore but are NOT propagated to the adapter until a FULL
+                            // init (version bump or cold start). User sees the toggle move
+                            // but no visible effect. Do NOT fix here — fix in the serializer.
                             ConfigurationOptionCard(
                                 title = "Video Resolution",
                                 description = "Select resolution for CarPlay. Android Auto not supported.",
@@ -534,6 +572,10 @@ fun AdapterConfigurationDialog(
                             }
 
                             // Frame Rate Configuration
+                            // HAZARD: same silent-drop issue as Video Resolution above — FPS
+                            // has no MessageSerializer.addChangedSettings branch, so a Tier-2
+                            // reinit persists the new value to DataStore without pushing it
+                            // to the adapter until a FULL init. See HAZARD above for details.
                             ConfigurationOptionCard(
                                 title = "Frame Rate",
                                 description = "FPS for CarPlay/Android Auto projection",
@@ -596,6 +638,14 @@ fun AdapterConfigurationDialog(
                                     )
                                 }
                                 Spacer(modifier = Modifier.height(8.dp))
+                                // HAZARD — PLACEHOLDER COPY shipping to end users.
+                                // Both strings are ambiguous/incorrect:
+                                //   LEFT  -> "Driving on the Right Side"  (LHD, but the copy
+                                //           reads as a location hint rather than LHD label)
+                                //   RIGHT -> "Driving on the wrong side"  (joke placeholder)
+                                // These must be replaced with proper user-facing copy before
+                                // release. Do NOT change the strings here without product
+                                // sign-off; only flagged for visibility.
                                 Text(
                                     text =
                                         when (selectedHandDrive) {
@@ -807,7 +857,14 @@ fun AdapterConfigurationDialog(
                         Text("Cancel")
                     }
 
-                    // Default button
+                    // Default button.
+                    // HAZARD — INCONSISTENT with Apply: this path resets DataStore preferences
+                    // but does NOT reinit the manager, kill the app, or call onReinitAdapter.
+                    // The current session keeps running on the OLD in-memory AdapterConfig
+                    // until some other trigger fires (version bump, cold start, later Apply).
+                    // The log message below says "next session will run FULL init", which
+                    // implies the user must restart manually — contrast Apply's auto-restart.
+                    // Consider harmonizing the two flows (do not change here without approval).
                     TextButton(
                         onClick = {
                             logWarn(
@@ -850,6 +907,9 @@ fun AdapterConfigurationDialog(
                                     ", tier=${if (miscChanged) "3-KILL" else "2-REINIT"}",
                                 tag = "UI",
                             )
+                            // NOTE: "callQuality=1(hardcoded)" in the log string above encodes
+                            // the firmware-bug workaround as a literal. If the BoxSettings
+                            // hardcode ever changes, this log will silently lie — keep in sync.
                             scope.launch {
                                 // Save all configuration
                                 adapterConfigPreference.setAudioSource(selectedAudioSource)
@@ -863,11 +923,17 @@ fun AdapterConfigurationDialog(
                                 adapterConfigPreference.setClusterNavigation(selectedClusterNavigation)
 
                                 if (miscChanged) {
-                                    // Tier 3: Misc settings changed — firmware-level changes
-                                    // require adapter reboot and full app restart.
+                                    // Tier 3: Misc settings changed — always kills the app,
+                                    // but ONLY GPS changes trigger an adapter reboot (see
+                                    // `needsReboot` below). WiFi-band and cluster-nav changes
+                                    // take the app-kill path with stop(reboot=false) — the
+                                    // adapter itself is NOT rebooted.
                                     // GPS forwarding: controls whether app sends GNSS_DATA (0x29) to adapter
+                                    //   -> needsReboot = true (adapter state change)
                                     // WiFi band: firmware radio reconfiguration
+                                    //   -> app kill only; adapter reboot NOT triggered here
                                     // Cluster navigation: CarAppActivity shim lifecycle
+                                    //   -> app kill only; adapter reboot NOT triggered here
                                     logWarn(
                                         "[ADAPTER_REINIT] Tier 3: Misc settings changed" +
                                             " (gps=${selectedGpsForwarding != savedGpsForwarding}" +
@@ -886,12 +952,29 @@ fun AdapterConfigurationDialog(
                                                     android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK,
                                             )
                                     launchIntent?.let { context.startActivity(it) }
+                                    // The 500ms delay gives startActivity(launchIntent) time
+                                    // to dispatch before we killProcess(myPid()) below —
+                                    // without it the new task may never come up.
+                                    //
+                                    // FRAGILITY: this block runs inside `scope.launch`. If the
+                                    // dialog leaves composition before the delay elapses, the
+                                    // coroutine is cancelled and killProcess is never called,
+                                    // leaving the new task racing the old PID. onDismiss() is
+                                    // deliberately NOT called on the Tier-3 path for this reason.
                                     kotlinx.coroutines.delay(500)
                                     android.os.Process.killProcess(android.os.Process.myPid())
                                 } else {
                                     // Tier 2: Audio/Visual settings only — in-place reinit.
                                     // Tear down adapter session, rebuild CarlinkManager with
                                     // new AdapterConfig, reconnect with MINIMAL_PLUS_CHANGES.
+                                    //
+                                    // HAZARD: the MINIMAL_PLUS_CHANGES name is accurate, but
+                                    // adapter-side coverage is INCOMPLETE — VIDEO_RESOLUTION
+                                    // and FPS have no branches in
+                                    // MessageSerializer.addChangedSettings, so changes to those
+                                    // two fields alone are saved to DataStore but not pushed to
+                                    // the adapter until a FULL init. See HAZARD at the Video
+                                    // Resolution / Frame Rate cards in the Visual tab above.
                                     logInfo(
                                         "[ADAPTER_REINIT] Tier 2: Audio/Visual settings only" +
                                             " — reinitializing in-place (no app kill)",

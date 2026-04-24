@@ -53,6 +53,11 @@ object MessageParser {
     /**
      * Parse a complete message from header and payload.
      *
+     * NOTE: this `when` has an `else` catch-all that returns [UnknownMessage] — so
+     * adding a new entry to [MessageType] without a case here will compile cleanly
+     * and fall through to the catch-all (showing up as [Logger.Tags.PROTO_UNKNOWN]
+     * at runtime). When you add a MessageType, add its branch here too.
+     *
      * @param header Parsed message header
      * @param payload Message payload bytes (can be null for some message types)
      * @return Parsed Message object
@@ -109,6 +114,9 @@ object MessageParser {
 
             MessageType.UI_HIDE_PEER_INFO -> InfoMessage(header, "UiHidePeerInfo")
 
+            // Observed as an active runtime signal during CarPlay session setup:
+            // emitted once with a zero-length payload shortly after the paired-list
+            // broadcast. Treated as diagnostic only at this layer.
             MessageType.UI_BRING_TO_FOREGROUND -> InfoMessage(header, "UiBringToForeground")
 
             MessageType.REMOTE_CX_CY -> parseHexPayload(header, payload, "RemoteCxCy")
@@ -156,11 +164,12 @@ object MessageParser {
      * header.length exceeds the bytes actually delivered by the USB bulk read.
      *
      * WHY: ByteBuffer.wrap(array, offset, length) throws IOOBE when
-     * offset+length > array.size. Before this helper, a short/corrupt frame
-     * from the adapter would crash the USB-ReadLoop thread mid-session
-     * (fatal — no further messages parsed until full reconnect). The clamp
-     * converts the crash into a logged drop; the state machine's existing
-     * reconnect logic then handles recovery.
+     * offset+length > array.size. Without this helper, a short/corrupt frame
+     * would throw out of the USB-ReadLoop thread and require a full reconnect to
+     * recover (UsbDeviceWrapper already caps header.length at MAX_PAYLOAD_SIZE,
+     * so the window was narrow — but the failure mode was fatal when it hit).
+     * The clamp converts any would-be crash into a logged drop; the state
+     * machine's existing reconnect logic then handles recovery if needed.
      *
      * Returns null only for negative declared length (hard protocol violation);
      * callers should treat null as "return UnknownMessage".
@@ -308,13 +317,14 @@ object MessageParser {
                     if (bodyLen < 1) {
                         emptyMap()
                     } else {
-                        // WHY trimEnd('\u0000') instead of old "header.length - 5":
-                        // the prior code hardcoded "4 byte subtype + 1 byte NUL" and
-                        // silently dropped the last JSON char when the adapter sent
-                        // frames without the trailing NUL (observed firmware variance,
-                        // same pattern as BT-address strings). trimEnd tolerates
-                        // 0..N trailing NULs without losing real content. trimEnd
-                        // (not trim) preserves leading NULs as a framing-bug signal.
+                        // WHY trimEnd('\u0000') instead of a hardcoded "header.length - 5":
+                        // the adapter's NUL-termination is inconsistent across payload
+                        // types (BT-address strings definitely vary; media JSON is
+                        // defensive against the same pattern). A hardcoded "-5" offset
+                        // would drop the last JSON char on any frame without the
+                        // trailing NUL. trimEnd tolerates 0..N trailing NULs without
+                        // losing real content; trimEnd (not trim) preserves leading
+                        // NULs as a framing-bug signal rather than silently masking.
                         val jsonString = String(payload, 4, bodyLen, StandardCharsets.UTF_8)
                             .trimEnd('\u0000')
                         try {
@@ -331,7 +341,9 @@ object MessageParser {
                 }
 
                 else -> {
-                    // Unknown subtype — preserve raw bytes for diagnostic logging
+                    // Unknown subtype — preserve raw bytes for diagnostic logging.
+                    // Keys are underscore-prefixed so downstream consumers treat them
+                    // as diagnostic metadata rather than real media fields.
                     val preview = if (bodyLen > 0) {
                         val limit = bodyLen.coerceAtMost(64)
                         val hex = StringBuilder(limit * 3)
@@ -401,7 +413,9 @@ object MessageParser {
 
         return try {
             val json = JSONObject(jsonString)
-            // Discriminate: second BoxSettings has MDModel (phone info)
+            // Discriminate: the phone-info form carries "MDModel"; the adapter-info
+            // form carries "uuid" (+ boxType / hwVersion / productType) and arrives
+            // as the adapter's echo of the host's BoxSettings write during FULL init.
             val isPhoneInfo = json.has("MDModel")
             BoxSettingsMessage(header, json, isPhoneInfo)
         } catch (e: JSONException) {
@@ -453,9 +467,14 @@ object MessageParser {
      * is used as a reliable delimiter to split entries.
      *
      * Example payloads:
-     *   "64:31:35:8C:29:69Luis"                          — single device
-     *   "64:31:35:8C:29:69Zeno\0B0:D5:FB:A3:7E:AAPixel"  — null-separated
-     *   "64:31:35:8C:29:69ZenoB0:D5:FB:A3:7E:AAPixel 10" — no separator
+     *   "AA:BB:CC:DD:EE:FFDoe"                           — single device
+     *   "AA:BB:CC:DD:EE:FFJane\011:22:33:44:55:66Pixel"  — null-separated
+     *   "AA:BB:CC:DD:EE:FFJane11:22:33:44:55:66Pixel 10" — no separator
+     *
+     * Verified against live CarPlay sessions: the single-device "MAC + name with no
+     * delimiter" form is actually emitted by real adapters (25-byte payload carrying
+     * a 17-byte MAC immediately followed by an 8-byte name such as "iPhone"). The
+     * regex split strategy survives this format without ambiguity.
      */
     private val BT_MAC_PATTERN = Regex("[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}")
 
@@ -539,6 +558,12 @@ object MessageParser {
 
 /**
  * Base class for all protocol messages.
+ *
+ * Sealed: every concrete subclass must live in THIS file (Kotlin sealed-class
+ * constraint). Do not extract subclasses without understanding that moving them
+ * will break the sealing contract. [InfoMessage] is the catch-all for known-type
+ * diagnostic-only frames; [UnknownMessage] is the catch-all for unrecognised
+ * MessageType codes (preserves raw payload for forensics).
  */
 sealed class Message(
     val header: MessageHeader,
@@ -649,9 +674,13 @@ class MediaDataMessage(
 }
 
 /**
- * Video streaming signal (synthetic, not from protocol).
- * Indicates that video data is being streamed directly to the renderer.
- * Used when video data bypasses message parsing for zero-copy performance.
+ * Video streaming signal (synthetic, not from the protocol wire).
+ * Emitted by [AdapterDriver]'s read loop when VIDEO_DATA arrives with
+ * data==null || dataLength==0 — i.e., the frame was consumed directly by the
+ * VideoDataProcessor for zero-copy rendering. The header.length is always 0
+ * as a clue that this is synthetic, not a real on-wire frame.
+ * Consumers ([CarlinkManager.handleMessage]) use it as a streaming-liveness
+ * pulse (keyframe request, STREAMING-state transition) without touching pixels.
  */
 object VideoStreamingSignal : Message(MessageHeader(0, MessageType.VIDEO_DATA)) {
     override fun toString(): String = "VideoStreamingSignal"
@@ -694,6 +723,17 @@ class PeerBluetoothAddressMessage(
  * Phase 0=terminated, 7=connecting, 8=streaming, 13=negotiation_failed.
  * NOTE: Phase 0 is a session termination signal (alternative to UNPLUGGED).
  * NOTE: Phase 13 indicates AirPlay session negotiation failed (e.g., viewArea/safeArea constraint violation).
+ *
+ * Observed on live CarPlay sessions: PLUGGED(phoneType=3 CARPLAY) arrives first, then
+ * Phase 7 ~1 s later, then Phase 8 ~1.8 s after that. [SessionTokenMessage] (0xA3)
+ * typically lands at the SAME millisecond as the Phase 8 transition — the encrypted
+ * telemetry is delivered as the adapter crosses into streaming. Clean session teardown
+ * does not require a Phase 0 (host-initiated stop sends DisconnectPhone+CloseDongle
+ * and the adapter may end the stream without a final Phase message).
+ *
+ * The adapter's internal CarPlay-phase state machine uses a broader enum (visible on
+ * its console as values like 0/1/2/3/100/101/102); only the subset above is
+ * transmitted over USB to the host.
  */
 class PhaseMessage(
     header: MessageHeader,
@@ -736,9 +776,21 @@ class BluetoothPairedListMessage(
 }
 
 /**
- * Encrypted session telemetry (0xA3).
- * AES-128-CBC encrypted JSON with phone/adapter info.
- * Key: SESSION_TOKEN_ENCRYPTION_KEY in MessageTypes.kt.
+ * Encrypted session telemetry (0xA3) — OPAQUE at this layer.
+ *
+ * Wire format is AES-128-CBC-encrypted JSON with phone/adapter info (phone model,
+ * adapter UUID, firmware version). The key [SESSION_TOKEN_ENCRYPTION_KEY] is
+ * declared in MessageTypes.kt for FUTURE decryption but is not currently used —
+ * this class stores only the encrypted payload size, and [CarlinkManager.handleMessage]
+ * logs receipt without decoding. Do not assume the decrypted fields are accessible
+ * from this message.
+ *
+ * Observed wire characteristics: payload is ASCII Base64 (with trailing `=` padding)
+ * typically 428 bytes long on CarPlay sessions; decodes to a 16-byte IV + an integer
+ * number of 16-byte AES-CBC ciphertext blocks. Arrives exactly once per session, at
+ * the same millisecond the adapter emits [PhaseMessage] with phase=8 (streaming).
+ * If the encrypted payload also appears in an in-tree capture header slot, treat it
+ * as potentially truncated; the authoritative source is always the 0xA3 body record.
  */
 class SessionTokenMessage(
     header: MessageHeader,

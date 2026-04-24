@@ -17,7 +17,7 @@ android {
         applicationId = "zeno.carlink"
         minSdk = 32
         targetSdk = 36
-        versionCode = 117
+        versionCode = 123
         versionName = "1.0.0"
 
 //###############################################
@@ -115,8 +115,16 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    // MediaSession for AAOS integration (uses MediaSessionCompat)
-    implementation("androidx.media:media:1.7.1")
+    // MediaSession for AAOS integration — Media3 1.10.0 (latest stable, 2026-03-26).
+    // media3-session supersedes legacy androidx.media:media (MediaSessionCompat, deprecated
+    // in androidx.media 1.8.0-alpha01). GM AAOS observers use platform android.media.session.*
+    // APIs which Media3 auto-registers under the hood for backwards compatibility, so the
+    // GMCarMediaService → ClusterService → cluster pipeline keeps working.
+    // media3-common provides Player / SimpleBasePlayer / MediaItem / MediaMetadata.
+    // media3-exoplayer is intentionally NOT included: this app does not decode/play audio
+    // locally — the connected phone plays over USB; we only mirror metadata + forward commands.
+    implementation("androidx.media3:media3-session:1.10.0")
+    implementation("androidx.media3:media3-common:1.10.0")
 
     // Car App Library for AAOS cluster navigation (Templates Host)
     implementation("androidx.car.app:app:1.7.0")

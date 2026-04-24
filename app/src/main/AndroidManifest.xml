@@ -99,15 +99,32 @@
                 android:value="true" />
         </activity>
 
-        <!-- MediaBrowserService for AAOS Integration -->
+        <!-- Media3 MediaLibraryService for AAOS Integration.
+             Dual intent-filter: the modern `androidx.media3.session.MediaLibraryService`
+             action for Media3-aware controllers, and the legacy
+             `android.media.browse.MediaBrowserService` action for AAOS Media Center and
+             other MediaBrowserCompat clients. Per Media3 migration guide
+             (developer.android.com/media/media3/exoplayer/migration-guide),
+             MediaLibraryService is backwards-compatible with legacy MediaBrowserCompat
+             clients, so declaring both actions covers both controller generations. -->
         <service
             android:name=".media.CarlinkMediaBrowserService"
             android:exported="true"
             android:foregroundServiceType="mediaPlayback|connectedDevice"
             tools:ignore="ExportedService">
             <intent-filter>
+                <action android:name="androidx.media3.session.MediaLibraryService" />
                 <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
+            <!-- AAOS CarLauncher opt-in. Required because carlink is BOTH a launcher
+                 app and an MBS: MediaSource.isMediaTemplate() classifies dual-role
+                 apps as "non media template" unless this explicit opt-in is present.
+                 Without it the homescreen Media card hides carlink, and any source
+                 re-election after a force-close fails to promote zeno.carlink (which
+                 in turn leaves ClusterHome with nothing to mirror). -->
+            <meta-data
+                android:name="androidx.car.app.launchable"
+                android:value="true" />
             <!-- GM Homescreen: Hide from launcher while keeping service functional -->
             <meta-data
                 android:name="com.gm.homescreen.visibility"

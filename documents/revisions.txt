@@ -357,5 +357,50 @@
    - MediaSessionManager.kt setPlaybackToLocal(STREAM_MUSIC) in initialize() so the default routing target is documented (rather than implicit). new setRingtoneRouting() (> STREAM_RING > USAGE_NOTIFICATION_RINGTONE) and setMediaRouting() ( > STREAM_MUSIC) methods
    - CarlinkManager.kt AUDIO_ALERT_START calls setRingtoneRouting() before setPurpose(ALERT), and AUDIO_ALERT_STOP calls setMediaRouting() before endPurpose(ALERT).
 
-{117} :: Revert 116 changes. Blocked Voice Assistant Volume adjust without improving ringtone control.
+[117] :: Revert 116 changes. Blocked Voice Assistant Volume adjust without improving ringtone control.
    - DualStreamAudioManager.kt Attempting to use GM AAOS vgroup2 BUS_CALL_RING, without Telecomm code.
+
+[118] :: Code Comment Updates across the entire project. Some code cleanup.
+
+[119] :: Media3 migration for MediaSession.
+   - androidx.media:media:1.7.1 -> androidx.media3:media3-session:1.10.0 + media3-common:1.10.0
+   - New UsbAdapterPlayer (SimpleBasePlayer) and MediaLibrarySession replace MediaBrowserServiceCompat path
+   - Dual intent-filter (MediaLibraryService + legacy MediaBrowserService) covers both controller generations
+   - androidx.car.app.launchable=true on MBS for AAOS homescreen card opt-in. Side effect: duplicate app-grid tile (com.gm.homescreen.visibility=HIDDEN not honored on GM).
+
+[120] :: Media3 correctness pass. Verified against GM AAOS logs + decompiled GMCarMediaService/CarMediaApp; no GM behavior change, portability fix for pure-Media3 controllers.
+   - MediaSessionManager.kt revokeUriFromConsumers() mirror to grantUriToConsumers. Fires on URI rotation, setStateStopped(), release(). Prior path never revoked; grants persisted until reboot.
+   - MediaSessionManager.kt release() now calls player.release() before mediaSession.release() per Media3 serve-content docs. Session.release() does NOT release the Player.
+   - MediaSessionManager.kt getMediaLibrarySession() snapshots mediaSession under sessionLock. Closes @Volatile race where release() could null session mid-lookup (permanent onGetSession reject).
+   - MediaSessionManager.kt onGetItem(ROOT_ID) returns the root MediaItem (was unconditional RESULT_ERROR_NOT_SUPPORTED). Non-root IDs return RESULT_ERROR_BAD_VALUE.
+   - MediaSessionManager.kt session-activity Intent adds FLAG_ACTIVITY_NEW_TASK — required by PendingIntent.getActivity when launched outside an Activity context.
+   - UsbAdapterPlayer.kt setPlayWhenReady uses PLAY_WHEN_READY_CHANGE_REASON_REMOTE (was USER_REQUEST). REMOTE is the documented reason for mirror Players driven by external transport.
+   - UsbAdapterPlayer.kt MediaItemData.uid derived from title^artist^album hash via itemUidFor(). Fixes suppressed Player.Listener.onMediaItemTransition on track change. GM unaffected (legacy MediaControllerCompat.onMetadataChanged).
+   - UsbAdapterPlayer.kt removed COMMAND_SET_MEDIA_ITEM + handleSetMediaItems override (was silent no-op reporting false success to controllers).
+   - UsbAdapterPlayer.kt postToMain adds DEBUG check(Looper.myLooper() == applicationLooper). POTATO log TID analysis: 100% updates on USB-ReadLoop — assert catches regressions.
+   - AlbumArtCache.kt authority now "${BuildConfig.APPLICATION_ID}.albumart" — matches manifest. Future applicationIdSuffix would diverge from context.packageName and break getUriForFile.
+
+[121] :: Triple-agent verification cleanup + protocol hardening + projection-state session gate + AAOS stale-card deficiency documented.
+   - MessageSerializer.kt removed duplicate androidWorkMode send from addFullSettings. Single write per connection via generateInitSequence minimal block.
+   - MessageSerializer.kt androidWorkMode now written UNCONDITIONALLY with current config value (was guarded by `if true`). Fixes stale `1` in /etc/android_work_mode after user opt-out mid-connection.
+   - MessageTypes.kt dual-direction wire IDs (0x88/0xBB/0xCD/0xCE/0xF0/0xFD) documented. Enum names reflect inbound only; outbound callers (serializeRebootAdapter/serializeUsbReset) piggy-back on enum entries for wire encoding.
+   - MediaSessionManager.kt mediaControlCallback now @Volatile. Public setter contradicted prior "set once at init" claim; volatile codifies cross-thread visibility.
+   - MediaSessionManager.kt:266 stale comment fixed (said NOT_SUPPORTED; code returns RESULT_ERROR_BAD_VALUE since [120]).
+   - UsbAdapterPlayer.kt itemUidFor now hashes "T|title|A|artist|B|album" instead of XOR of per-field hashes. Eliminates field-permutation collision edge case.
+   - CarlinkMediaBrowserService.kt KDoc corrected: Media3 constant is DEFAULT_NOTIFICATION_ID, not NOTIFICATION_ID (value 1001 unchanged).
+   - UsbAdapterPlayer.kt adds isSessionActive gate; getState() returns empty playlist + STATE_IDLE when false.
+   - MediaSessionManager.kt setProjectionActive()/setInactive() replace setStateConnecting/setStateStopped. Session toggles on PLUGGED event, not app lifecycle.
+   - MediaSessionManager.kt initialize() no longer publishes placeholder metadata. Session starts inactive so other apps can promote freely.
+   - CarlinkManager.kt updateMediaSessionState wires DEVICE_CONNECTED → setProjectionActive(), CONNECTING/DISCONNECTED → setInactive(). Tracks true projection state.
+   - KDoc across MediaSessionManager/CarlinkManager/UsbAdapterPlayer documents confirmed AAOS CarLauncher stale-card bug after force-stop.
+   - Apple Music 5.2.1 reproduced the same stale card — platform limitation, not app-side. No app workaround exists.
+
+[122] :: riddleBoxCfg injection + MediaSession ownership refactor (blank homescreen card) + [PROBE] diagnostics.
+   - MessageSerializer.kt injects riddleBoxCfg CallQuality=1/VoiceQuality=1 via unsanitized-sed escape; persists to /etc/riddle.conf before BoxSettings.
+   - MainActivity.kt owns MediaSessionManager at app-scope. Created once per ADAPTER-mode init, released only from onDestroy.
+   - CarlinkManager.kt takes injectedMediaSessionManager via constructor. initialize() only attaches callback; release() only detaches — never releases.
+   - Fixes blank CarLauncher homescreen card after AdapterConfigurationDialog Apply. Tier-2 rebuild no longer recreates the MediaSession token.
+   - Root cause: release+init gap fired onSessionDestroyed; CarLauncher MediaControllerCompat did not rebind to the new token.
+   - MediaSessionManager.kt libraryCallback gains [PROBE] logs on onConnect/onDisconnected/onGetLibraryRoot/onGetChildren/onGetItem/onSubscribe. BuildConfig.DEBUG-gated, R8-stripped in release.
+
+[123] :: Code Cleanup

@@ -1,11 +1,14 @@
 # Inbound Session Message Sequence
 
-> **Status**: Non-definitive — still testing. Based on 4 observed wireless CarPlay sessions
+> **Status**: Non-definitive — still testing. Based on observed wireless CarPlay sessions
 > with CPC200-CCPA firmware `2025.10.15.1127CAY` and iPhone 18,4.
 >
-> Captured 2026-02-19 via adb logcat `[RECV]` messages.
+> Captured 2026-02-19 via adb logcat `[RECV]` messages; re-verified 2026-04-20 via macOS
+> CarLink client USB capture.
 >
 > **Note (Mar 2026):** Type IDs corrected to match protocol spec (usb_protocol.md dispatch table). Original capture used log-derived sequence numbers that did not correspond to USB message type IDs.
+>
+> **Note (Apr 2026):** Host-side init sequence block added below (was previously undocumented — only inbound/adapter-origin messages were captured in Feb 2026).
 
 ## Overview
 
@@ -17,6 +20,31 @@ High-frequency data messages (VIDEO_DATA, AUDIO_DATA, HEARTBEAT_ECHO) are exclud
 this documents only control/state messages.
 
 ## Sequence
+
+### Phase 0 — Host Init (host → adapter, before adapter responds)
+
+Observed in macOS CarLink client session 2026-04-20 (FW `2025.10.15.1127CAY`, iPhone18,4). Timings are relative to USB attach.
+
+| Δ | Message | Type ID | Content |
+|---|---------|---------|---------|
+| +0.124s | Heartbeat timer started (first fire at t=+2s) | 0xAA | — |
+| +0.381s | `SENDFILE /tmp/screen_dpi` | 0x99 | 4B (DPI, e.g. `a0 00 00 00` = 160) |
+| +0.510s | `OPEN 2400x960@60fps mode=2` | 0x01 | 28B (W,H,fps,format,phoneWorkMode,audioTransMode,mediaDelay) |
+| +0.636s | `BOXSETTINGS (host JSON)` | 0x19 | ~280B JSON (CallQuality, DashboardInfo, GNSSCapability, box/bt/wifiName, androidAutoSize, etc.) |
+| +0.764s | `SENDFILE /etc/RiddleBoxData/HU_VIEWAREA_INFO` | 0x99 | 24B (W,H,viewW,viewH,offX,offY) |
+| +0.890s | `SENDFILE /etc/RiddleBoxData/HU_SAFEAREA_INFO` | 0x99 | 20B (W,H,insetT,insetB,insetL,insetR) |
+| +2.364s | `SENDFILE /etc/android_work_mode` | 0x99 | 4B (LE; `01 00 00 00` = Android Auto enabled, `00 00 00 00` = disabled) |
+| +2.523s | `CMD WIFI_ENABLE` | 0x08 | cmdId=1000 |
+| +2.523s | `CMD WIFI_CONNECT` (if autoConn) | 0x08 | cmdId=1002 |
+| +2.810s | `SENDFILE /tmp/hand_drive_mode` | 0x99 | 4B |
+| +2.810s | `SENDFILE /etc/box_name` | 0x99 | variable (e.g. `CarLink`, 7B) |
+| +2.937s | `SENDFILE /tmp/charge_mode` | 0x99 | 4B |
+| +2.937s | `CMD USE_5G_WIFI` | 0x08 | cmdId=25 |
+| +2.937s | `CMD USE_CAR_MIC` | 0x08 | cmdId=7 |
+| +2.937s | `CMD USE_BOX_TRANS_AUDIO` | 0x08 | cmdId=23 |
+| +3.108s | `SENDFILE /etc/airplay.conf` | 0x99 | 113B (OEM/car-specific AirPlay config) |
+
+**Key observation:** the host pushes `/etc/android_work_mode` during init. Because the firmware resets this file's effective value on every USB disconnect (`fcn.00017940` in `ARMadb-driver`, see `06_Reference/firmware_internals.md` — "Both modes reset to 0 on disconnect"), the host MUST send it fresh on every connection for Android Auto to be selectable. Value is raw little-endian uint32 (0=disabled, 1=enabled).
 
 ### Phase 1 — Init Echo (adapter acknowledges host config)
 
@@ -129,6 +157,8 @@ Follows immediately after streaming begins.
    - BT connected: +2-3s
    - Plugged: +3-4s
    - Streaming: +5-7s from init start
+
+   **First-pair / manual-accept flows take much longer.** Observed 2026-04-20 macOS session: ready (post-init) at +3.1s, `BoxSettings(phone:MDLinkType=CarPlay)` not received until +75.1s, `Phase(8=streaming)` at +78.3s. The delay is entirely on the iPhone side (user taps "Use This Car" + trust prompt). The +5-7s figure only applies to auto-connect-enabled re-pairs. Host state machines should not treat a 60–90s gap between Init Echo and Plugged as a timeout.
 
 6. **Phase 13 = negotiation failed** — Not an internal firmware phase (internal phases
    are 0-3, 100-106, 200). Phase 13 is only sent to the host over USB when AirPlay

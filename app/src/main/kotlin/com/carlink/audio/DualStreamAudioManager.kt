@@ -35,27 +35,32 @@ object AudioStreamType {
  * Alert, Navigation), with ring buffers to absorb USB packet jitter.
  *
  * ARCHITECTURE:
+ * Ring-buffer capacities are platform-dependent ([AudioConfig.mediaBufferCapacityMs] /
+ * [AudioConfig.navBufferCapacityMs]); the values shown are typical defaults.
  * ```
  * USB Thread (non-blocking)
  *     │
- *     ├──► Media Ring Buffer (500ms) ──► Media AudioTrack (USAGE_MEDIA)
- *     ├──► Siri Ring Buffer (500ms)  ──► Siri AudioTrack (USAGE_ASSISTANT)
- *     ├──► Call Ring Buffer (500ms)  ──► Call AudioTrack (USAGE_VOICE_COMMUNICATION)
- *     ├──► Alert Ring Buffer (500ms) ──► Alert AudioTrack (USAGE_NOTIFICATION_RINGTONE)
- *     └──► Nav Ring Buffer (200ms)   ──► Nav AudioTrack (USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+ *     ├──► Media Ring Buffer (~500ms) ──► Media AudioTrack (USAGE_MEDIA)
+ *     ├──► Siri Ring Buffer  (~500ms) ──► Siri AudioTrack (USAGE_ASSISTANT)
+ *     ├──► Call Ring Buffer  (~500ms) ──► Call AudioTrack (USAGE_VOICE_COMMUNICATION)
+ *     ├──► Alert Ring Buffer (~500ms) ──► Alert AudioTrack (USAGE_VOICE_COMMUNICATION_SIGNALLING)
+ *     └──► Nav Ring Buffer   (~200ms) ──► Nav AudioTrack (USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
  *     │
  *     └──► Playback Thread (THREAD_PRIORITY_URGENT_AUDIO)
  *             reads from all buffers, writes to AudioTracks
  * ```
+ * ALERT uses USAGE_VOICE_COMMUNICATION_SIGNALLING (not USAGE_NOTIFICATION_RINGTONE) as
+ * a deliberate workaround for GM AAOS bus routing — see [purposeToAttributes].
  *
  * ROUTING:
  * PCM packets are routed by two-factor matching: audio command state flags + format match.
  * This prevents transition artifacts where media PCM briefly routes to the wrong AudioTrack
  * when purpose changes (e.g., SIRI_START arrives but adapter still sends media PCM).
  * - audioType=2 → Navigation
- * - audioType=1 + isPhoneCallActive + 8kHz mono → PhoneCall track
+ * - audioType=1 + isPhoneCallActive + mono @ 8kHz (AA HFP/SCO) or 16kHz (CarPlay iAP2) → PhoneCall track
  * - audioType=1 + isSiriActive + 16kHz mono → Siri track
- * - audioType=1 + isAlertActive + 24kHz mono → Alert track
+ * - audioType=1 + isAlertActive → Alert track (format-agnostic; ensureSlotFormat handles
+ *     48kHz/2ch CarPlay or 24kHz/1ch AA)
  * - audioType=1 + anything else → Media track (default, catches transition-period packets)
  *
  * THREAD SAFETY:
@@ -184,11 +189,17 @@ class DualStreamAudioManager(
         var idleSince: Long = 0,
     )
 
-    // Pause a playing track after its buffer has been empty for this long.
-    // Prevents AAOS volume keys from being hijacked by stale PLAYING tracks.
+    // After a slot's ring buffer has been empty for this long while playing, take
+    // an idle action. Prevents AAOS volume keys from being hijacked by stale PLAYING
+    // tracks. Action depends on purpose (see playback-thread idle handling at line ~1170):
+    //   - MEDIA, PHONE_CALL, SIRI: write a silence frame to keep the track PLAYING
+    //     (avoids volume-context flap during natural inter-packet gaps).
+    //   - ALERT: actually pause (short bursts with explicit start/end signals).
     private val idlePauseMs = 200L
 
-    // Minimum playback duration before allowing stop (fixes premature cutoff - Sessions 1-2)
+    // Reject NAVI_COMPLETE if the prompt has been audible for less than this many ms
+    // and the buffer still holds >50ms of data — guards against the adapter sending
+    // STOP before the prompt has had time to play.
     private val minNavPlayDurationMs = 300
 
     // Skip warmup noise: mixed 0xFFFF/0x0000/0xFEFF patterns for ~200-400ms after NavStart
@@ -388,7 +399,9 @@ class DualStreamAudioManager(
                 // Drop packets after NAVI_STOP (~2s silence before NAVI_COMPLETE per USB captures)
                 if (navStopped) return 0
 
-                // Check end marker before track creation (navStartTime may be 0)
+                // Check end marker before track creation (navStartTime may be 0 — this is
+                // the cold-start path; nav track never allocated in 2026-04-20 POTATO
+                // sessions, Nav[Rx:0] in every AUDIO_PERF log).
                 if (isNavEndMarker(data, dataOffset, dataLength)) {
                     flushNavBuffers()
                     consecutiveNavZeroPackets = 0
@@ -935,12 +948,17 @@ class DualStreamAudioManager(
     /**
      * Create an AudioTrack with per-purpose AudioAttributes for AAOS CarAudioContext mapping.
      *
-     * AAOS CarAudioContext Mapping:
-     * - USAGE_MEDIA → MUSIC context
-     * - USAGE_VOICE_COMMUNICATION → CALL context
-     * - USAGE_ASSISTANT → VOICE_COMMAND context
-     * - USAGE_NOTIFICATION_RINGTONE → CALL_RING context
-     * - USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → NAVIGATION context
+     * AAOS CarAudioContext Mapping (this file's actual emissions):
+     * - MEDIA        → USAGE_MEDIA                          → MUSIC context
+     * - PHONE_CALL   → USAGE_VOICE_COMMUNICATION            → CALL context
+     * - SIRI         → USAGE_ASSISTANT                      → VOICE_COMMAND context
+     * - ALERT        → USAGE_VOICE_COMMUNICATION_SIGNALLING → CALL_RING (intended; GM-specific)
+     * - NAVIGATION   → USAGE_ASSISTANCE_NAVIGATION_GUIDANCE → NAVIGATION context
+     *
+     * The ALERT mapping is a deliberate GM-AAOS workaround (not the AOSP default of
+     * USAGE_NOTIFICATION_RINGTONE → CALL_RING). See [purposeToAttributes] for the
+     * rationale and `documents/reference/gminfo/audio/audio_subsystem.md` for the
+     * authoritative GM volume-group / bus-routing tables.
      */
     private fun createAudioTrack(
         format: AudioFormatConfig,

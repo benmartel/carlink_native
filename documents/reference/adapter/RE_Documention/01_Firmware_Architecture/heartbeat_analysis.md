@@ -87,7 +87,9 @@ Hex: AA 55 AA 55 00 00 00 00 AA 00 00 00 55 FF FF FF
 
 - **Type:** 0xAA (170 decimal)
 - **Payload:** None (header-only message)
-- **Direction:** Bidirectional (host ↔ adapter)
+- **Direction:** Host → adapter only on FW `2025.10.15.1127CAY` — see note below
+
+> **Capture-verified 2026-04-20** (macOS CarLink client, FW `2025.10.15.1127CAY`, 1452s session): **716 TX heartbeats, 0 RX heartbeats**. The adapter does not echo 0xAA on this firmware. The "bidirectional" description in earlier revisions of this doc was aspirational (both sides *could* send, per binary support) — in practice on 2025.10.XX only the host emits them. Adapter-origin heartbeats have not been observed in any capture session 2026-02 → 2026-04. Treat 0xAA as host→adapter one-way for current firmware.
 
 ---
 

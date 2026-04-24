@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
 import androidx.core.content.FileProvider
+import androidx.core.graphics.scale
 import com.carlink.BuildConfig
 import java.io.File
 import java.io.FileOutputStream
@@ -21,23 +22,56 @@ private const val TAG = "CARLINK_ART_CACHE"
  * Bitmap in [MediaSessionManager.publishMetadata]. URI keys are additive — the
  * inline Bitmap is the primary carrier because a broken URI (write failure,
  * missing file) causes AAOS renderers to suppress the whole metadata bundle
- * and blank the card. Writes are instrumented (CARLINK_ART_CACHE logtag) so
- * any silent failure surfaces in logcat rather than manifesting as an empty UI.
+ * and blank the card. Writes are instrumented (CARLINK_ART_CACHE logtag, via
+ * android.util.Log directly rather than the project Logger — keeps cache-write
+ * failures out of the FileLogManager path, which itself goes to disk) so any
+ * silent failure surfaces in logcat rather than manifesting as an empty UI.
  *
  * Caching strategy:
- * - Key by SHA-1 of raw image bytes → idempotent across re-sends of the same cover.
+ * - Key by SHA-1 of the raw input byte[] → idempotent only for byte-identical
+ *   re-sends. Re-encoded versions of the same image (different JPEG quality,
+ *   different container) will miss and store a duplicate. SHA-1 is used as a
+ *   content hash, NOT a security primitive.
  * - Two-pass decode: [BitmapFactory.Options.inJustDecodeBounds] then compute
  *   `inSampleSize` to decode directly at a near-target resolution.
  * - Persist as JPEG quality 85 at RGB_565 → small files, imperceptible loss.
- * - Bounded LRU: keep [MAX_FILES] most-recent files, prune older on each write.
+ * - Bounded LRU: keep [MAX_FILES] (32 ≈ ~1 MiB total at current sizes) most-recent
+ *   files, prune older on each write.
  *
- * Decoding is blocking; call [put] / [decodeDisplayIcon] from a background
- * dispatcher. Result URIs are thread-safe to hand to [setMetadata].
+ * Lifecycle: the cache is NEVER explicitly cleared — not on adapter disconnect,
+ * not on MediaSessionManager.release(), not on app restart. Bounded only by the
+ * LRU cap and the device's cacheDir lifecycle (uninstall / Clear Cache / low-
+ * storage reclaim). Intentional: keeps common-album art warm across sessions.
+ *
+ * Threading contract:
+ * - [put] does blocking disk I/O and full-image decode — call from a background
+ *   dispatcher (MediaSessionManager uses Dispatchers.IO).
+ * - Result URIs are safe to hand to [setMetadata] from any thread.
+ * - The cache itself is NOT thread-safe per-instance: concurrent [put] calls for
+ *   the same hash can race on FileOutputStream, and [pruneIfOver] can delete a
+ *   file another [put] just finished writing. Callers must serialize writes for
+ *   a given cache instance (MediaSessionManager does this by posting each
+ *   metadata change onto its single-threaded scope).
+ *
+ * URI permissions: this class only creates the FileProvider URI; it does NOT
+ * grant read access. Callers (see MediaSessionManager.grantUriToConsumers)
+ * must grantUriPermission() to each consuming package before publishing.
  */
 class AlbumArtCache(
     private val context: Context,
 ) {
-    private val authority: String = "${context.packageName}.albumart"
+    // Persistence contract: must match AndroidManifest.xml <provider android:authorities>
+    // and the <cache-path> in res/xml/file_paths_albumart.xml. Renaming on either side
+    // silently breaks URI issuance with no compile error.
+    //
+    // BuildConfig.APPLICATION_ID is the Gradle applicationId that Android's manifest
+    // merger substitutes into `${applicationId}.albumart` at build time — it is the
+    // AUTHORITATIVE value the FileProvider is registered against. Using context.packageName
+    // is subtly different: if a future flavor adds `applicationIdSuffix` (e.g. ".debug")
+    // the runtime packageName diverges from the manifest-baked authority, and
+    // FileProvider.getUriForFile throws IllegalArgumentException ("authority not
+    // registered"). Bind to BuildConfig to keep manifest and code in lockstep.
+    private val authority: String = "${BuildConfig.APPLICATION_ID}.albumart"
     private val dir: File = File(context.cacheDir, DIR_NAME).also { d ->
         val made = d.mkdirs()
         if (BuildConfig.DEBUG) Log.d(TAG, "dir=${d.absolutePath} existed=${!made && d.exists()} created=$made writable=${d.canWrite()}")
@@ -92,15 +126,6 @@ class AlbumArtCache(
         return FileProvider.getUriForFile(context, authority, file)
     }
 
-    /**
-     * Decode a small bitmap for [android.support.v4.media.MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON]
-     * fallback. Kept because some AAOS OEM forks do not reliably auto-grant the
-     * FileProvider URI permission to media controllers — the inline icon guarantees
-     * something shows up while the URI path is exercised.
-     */
-    fun decodeDisplayIcon(bytes: ByteArray, maxPx: Int = DISPLAY_ICON_MAX_PX): Bitmap? =
-        decodeDownscaled(bytes, maxPx)
-
     private fun decodeDownscaled(bytes: ByteArray, maxPx: Int): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
@@ -112,11 +137,9 @@ class AlbumArtCache(
         val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decode) ?: return null
         if (raw.width <= maxPx && raw.height <= maxPx) return raw
         val ratio = minOf(maxPx.toFloat() / raw.width, maxPx.toFloat() / raw.height)
-        val scaled = Bitmap.createScaledBitmap(
-            raw,
+        val scaled = raw.scale(
             (raw.width * ratio).toInt().coerceAtLeast(1),
             (raw.height * ratio).toInt().coerceAtLeast(1),
-            true,
         )
         if (scaled !== raw) raw.recycle()
         return scaled
@@ -152,7 +175,6 @@ class AlbumArtCache(
     companion object {
         private const val DIR_NAME = "albumart"
         private const val DEFAULT_MAX_PX = 320
-        private const val DISPLAY_ICON_MAX_PX = 256
         private const val JPEG_QUALITY = 85
         private const val MAX_FILES = 32
     }

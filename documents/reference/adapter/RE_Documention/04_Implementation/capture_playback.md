@@ -68,7 +68,7 @@ Captures consist of two files:
 - `capture.json` - Packet metadata (sequence, type, timestamp, offset, length)
 - `capture.bin` - Raw binary packet data
 
-### Format Differences: pi-carplay vs carlink_native
+### Format Differences: pi-carplay vs carlink_native vs carlink_macOS
 
 **CRITICAL:** The capture format differs between implementations. This affects header parsing.
 
@@ -95,24 +95,62 @@ Offset  Size  Description
 ```
 **Total header size: 36 bytes**
 
+#### carlink_macOS CLNK recorder format (Apr 2026)
+
+The macOS CarLink client (`zeno.carlink.mac`, `SessionRecorder`) emits a third, container-oriented format distinct from both of the above. The 16-byte USB protocol header and `typeCheck` field are stripped by the recorder; direction and timing metadata are prepended per record.
+
+```
+File layout:
+0       4     Magic  "CLNK" (ASCII)
+4       4     Version (LE uint32, currently = 1)
+8       8     Session start timestamp (LE uint64 ns since Unix epoch)
+16      8     Session end timestamp   (LE uint64 ns)
+24      N     Firmware version string, null-terminated (e.g. "2025.10.15.1127CAY\0")
+...     -     Padding to 256 bytes total header
+256     ...   Packet record stream (see below)
+
+Per-packet record:
++0      1     Direction  (0x01 = TX host→adapter, 0x00 = RX adapter→host)
++1      4     Timestamp  (LE uint32 ms since session start)
++5      4     Type       (LE uint32 — protocol type; e.g. 0x06 video, 0x07 audio, 0xAA heartbeat)
++9      4     Length     (LE uint32 — payload byte count)
++13     N     Payload    (raw payload only; no 0x55AA55AA magic, no typeCheck)
+```
+
+**Total header size (protocol + video header, for injection back into carlink_native decode path):** 0 — the recorder has already stripped them. When replaying through a carlink_native-style pipeline, you must re-synthesize the 16-byte protocol header and (for video) the 20-byte video header before feeding the decoder.
+
+**⚠ Video payload truncation (recorder-side lossy capture):** the macOS recorder **truncates every `type=0x06` VideoData payload to the first 512 bytes of H.264 plus the 20B video header**, yielding 532-byte records regardless of actual frame size. Confirmed: 65,374 / 65,377 video frames in a reference 2026-04-20 capture were exactly 532 B. **Full-frame replay is impossible from macOS captures** — only header + NAL-prefix inspection is reliable. For full-payload analysis, use carlink_native or pi-carplay recorders.
+
+Audio (`0x07`), heartbeat (`0xAA`), command (`0x08`), and other non-video payloads are captured in full.
+
 ### Format Detection
 
-Check the first 4 bytes of the binary:
+For the pi-carplay vs carlink_native split (both start with protocol magic), check the first 4 bytes of the binary:
 - If `aa 55 aa 55` (little-endian magic) → carlink_native format (36-byte video header)
 - If NOT magic → pi-carplay format (48-byte video header, skip 12-byte prefix)
 
+For the carlink_macOS format, check the first 4 bytes for the ASCII magic `"CLNK"` (`43 4c 4e 4b`).
+
 ```kotlin
-val magic = ByteBuffer.wrap(data, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
-val isPiCarplayFormat = (magic != 0x55AA55AA)
-val videoHeaderSize = if (isPiCarplayFormat) 48 else 36
+val firstFour = ByteBuffer.wrap(data, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
+val format = when {
+    firstFour == 0x4B4E4C43 -> CaptureFormat.CARLINK_MACOS       // "CLNK" ASCII
+    firstFour == 0x55AA55AA -> CaptureFormat.CARLINK_NATIVE       // protocol magic
+    else                    -> CaptureFormat.PI_CARPLAY           // with 12-byte record prefix
+}
 ```
 
 ### Header Size Summary
 
-| Packet Type | pi-carplay | carlink_native |
-|-------------|------------|----------------|
-| **Video header** | 48 bytes | 36 bytes |
-| **Audio header** | 40 bytes | 28 bytes |
+| Packet Type | pi-carplay | carlink_native | carlink_macOS |
+|-------------|------------|----------------|---------------|
+| **File preamble** | 0 | 0 | 256 bytes (CLNK + ts + fwver) |
+| **Per-record prefix** | 12 | 0 | 13 (dir + ts + type + len) |
+| **Protocol header** | 16 | 16 | **0 (stripped)** |
+| **Video header** | 20 | 20 | 20 (prepended to H.264 payload) |
+| **Total video prefix** | 48 | 36 | 13 (+ 20 internal video header = 33) |
+| **Audio header** | 40 | 28 | 13 (+ 12 internal audio header = 25) |
+| **Video payload** | full | full | **capped at 512 B** |
 
 ---
 

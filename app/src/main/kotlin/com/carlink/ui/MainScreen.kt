@@ -97,10 +97,18 @@ fun MainScreen(
 
     // Container dimensions (display-mode-padded area) — used for BoxSettings AR calculation.
     // Tracked separately from surfaceState because AA oversizes the SurfaceView beyond the container.
+    // NOTE: activeTouches (L95) may leak stale DOWN entries if the SurfaceView is destroyed
+    // mid-gesture (AA resize) without a matching UP; bounded-minor leak cleared on next manager
+    // reinit (remember(carlinkManager) resets the map).
     var containerSize by remember(carlinkManager) { mutableStateOf(IntSize.Zero) }
 
     // Handle surface initialization for adapter — uses CONTAINER dimensions for config/BoxSettings,
-    // not the SurfaceView dimensions (which may be oversized for AA bar cropping).
+    // not the SurfaceView dimensions (oversized for AA bar cropping — confirmed in AutoKit; not
+    // exercised in 2026-04-20 POTATO gminfo37 captures since all sessions ran CarPlay isAA=false).
+    // Re-invoked on every Surface change (SurfaceView destroy→create, AA oversize resize, rotation);
+    // CarlinkManager.initialize MUST be idempotent. hasStartedConnection (L96) is cleared only on
+    // manager swap, so a new Surface with the same manager (AA resize) will re-initialize but will
+    // NOT re-invoke start() — preserving the session.
     LaunchedEffect(surfaceState.surface, containerSize) {
         surfaceState.surface?.let { surface ->
             if (containerSize.width <= 0 || containerSize.height <= 0) return@let
@@ -134,6 +142,10 @@ fun MainScreen(
                         }
 
                         override fun onPhoneTypeChanged(phoneType: PhoneType) {
+                            // Known limitation: aaCropParams is only refreshed on phoneType transition.
+                            // If CarlinkManager later recomputes crop params (e.g. mid-session display
+                            // resize), this UI won't see the update until the next phoneType toggle or
+                            // manager reinit.
                             val isAA = phoneType == PhoneType.ANDROID_AUTO
                             if (isAA != isAndroidAuto) {
                                 isAndroidAuto = isAA
@@ -175,8 +187,10 @@ fun MainScreen(
                 baseModifier
                     .windowInsetsPadding(WindowInsets.systemBars)
             }
-            // No displayCutout padding — video extends behind cutout,
-            // SafeArea tells CarPlay where to avoid placing UI elements
+            // No displayCutout padding — video extends behind cutout.
+            // (SafeArea, which tells CarPlay where to avoid placing UI, is NOT sent from this file —
+            // it is emitted by CarlinkManager/MessageSerializer. This comment documents the visual
+            // intent of the hidden-bars branch above, not an action performed here.)
         }
 
     Box(modifier = boxModifier) {
@@ -186,6 +200,8 @@ fun MainScreen(
         // Black bars in the codec frame fall outside the clip → cropped visually.
         // Codec start is deferred until phone type is known, so surface resize
         // (destroyed→created at oversized dims) happens before decoder is active.
+        // (Cross-file: the deferral is enforced in CarlinkManager.kt — see initialize()
+        // and the phone-type gate around the codec start path, approx. :247 / :1153 / :1477.)
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().clipToBounds(),
         ) {
@@ -413,6 +429,7 @@ fun MainScreen(
     }
 }
 
+/** In-memory per-pointer touch record (normalized 0..1 coords + last action) for deduping MOVE spam. */
 private data class TouchPoint(
     val x: Float,
     val y: Float,
@@ -457,8 +474,19 @@ private fun handleTouchEvent(
     val cropTopY = (surfaceHeight - containerHeight) / 2f
 
     // Normalize to 0..1 of the oversized surface (matches AutoKit's scaled_height denominator).
-    // X: surface width == container width (no horizontal oversize), simple division.
-    // Y: subtract crop offset, divide by SURFACE height (not container) so AA range maps correctly.
+    // X: assumed surface width == container width. Verified for AA per AutoKit. CarPlay POTATO
+    //    logs 2026-04-20 show off-by-1 drift (container 1604x960 vs surface 1605x960; 2210x960
+    //    vs 2211x842) — 1-px error is inside MotionEvent rounding and harmless, but if a future
+    //    AA tier ever oversizes W this assumption breaks silently (touch x would undershoot).
+    // Y: subtract crop offset, divide by SURFACE height (not container).
+    //
+    // Confirmed against AutoKit: its AA touch path normalizes with `(x * 10000) / scaled_width`
+    // and `(y * 10000) / scaled_height`, where `scaled_width`/`scaled_height` are the OVERSIZED
+    // post-resize view dimensions (not the visible content box). Dividing by surfaceHeight here
+    // reproduces that denominator — the visible-area y normalizes to 0..(containerHeight/surfaceHeight),
+    // e.g. 0..0.711 for a 1350/960 AA tier. AA side then scales 0..1 → 0..10000 at
+    // CarlinkManager.kt (near sendMultiTouch), so bottom-of-visible touches cap near ~7111 rather
+    // than 10000 — matching what the adapter expects.
     val x = event.getX(pointerIndex) / surfaceWidth
     val y = (event.getY(pointerIndex) - cropTopY) / surfaceHeight
 
@@ -473,6 +501,10 @@ private fun handleTouchEvent(
                 val px = event.getX(i) / surfaceWidth
                 val py = (event.getY(i) - cropTopY) / surfaceHeight
                 activeTouches[id]?.let { existing ->
+                    // Deadband: delta is normalized 0..1, multiplied by 1000 then compared against 3.
+                    // Effective threshold ≈ 0.003 of the normalized surface (~0.3%), i.e. ~30 units
+                    // on AA's 0..10000 scale, ~7 px horizontal / ~4 px vertical on a 2400x1350 AA
+                    // surface. Suppresses sub-pixel MOVE spam without losing real drags.
                     val dx = kotlin.math.abs(existing.x - px) * 1000
                     val dy = kotlin.math.abs(existing.y - py) * 1000
                     if (dx > 3 || dy > 3) activeTouches[id] = TouchPoint(px, py, MultiTouchAction.MOVE)
@@ -484,6 +516,9 @@ private fun handleTouchEvent(
             activeTouches[pointerId] = TouchPoint(x, y, action)
         }
 
+        // Dead / defensive: the when at L447-451 only yields DOWN/MOVE/UP (other MotionEvent
+        // actions early-return). This branch exists to satisfy exhaustiveness and guard against
+        // future MultiTouchAction additions. Intentionally a no-op.
         else -> {}
     }
 

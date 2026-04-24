@@ -703,6 +703,61 @@ The main `ARMadb-driver` process (PID 199) acts as a supervisor, spawning 3 chil
 
 Max 30 restarts before full reset. See `key_binaries.md` for MiddleMan IPC protocol details.
 
+### Work Mode State Callbacks (Live Verified Apr 2026)
+
+The firmware exposes two D-Bus-style callbacks that fire when the adapter's phone-mode state changes. **Both callbacks take two arguments**: `(previous_mode, new_mode)`.
+
+```
+OniPhoneWorkModeChanged: <prev> <new>     # iPhone side (CarPlay, iOSMirror, ...)
+OnAndroidWorkModeChanged: <prev> <new>    # Android side (AndroidAuto, AndroidMirror, HiCar, ICCOA, CarLife, Generic)
+```
+
+**iPhone work modes** (from `/etc/phone_work_mode` or runtime state): 0 = None, 2 = CarPlay, 3 = iOSMirror, 4 = Reserved.
+
+**Android work modes** (from `/etc/android_work_mode`): 0 = None, 1 = AndroidAuto, 2 = CarLife, 3 = HiCar, 4 = ICCOA, 5 = AndroidMirror. See the `RiddleLinkType` enum note in MEMORY.md §Firmware Binary Analysis for the full 8-entry link-type mapping.
+
+**Observed transition patterns (2026-04-20 POTATO cpc200 logs):**
+
+| Sequence | Meaning |
+|---|---|
+| `OniPhoneWorkModeChanged: 0 2` | iPhone plugged, CarPlay selected |
+| `OniPhoneWorkModeChanged: 2 2` | CarPlay session re-triggered (no mode change) |
+| `OniPhoneWorkModeChanged: 2 0` | iPhone unplugged (reset to None) |
+| `OnAndroidWorkModeChanged: 1 0` → `0 0` → `0 1` | Android-side mode toggle sequence during AA hotplug attempts |
+
+**Critical:** Both modes reset to 0 on USB disconnect (`fcn.00017940`). The host MUST re-send `/etc/android_work_mode` on every reconnect for AA to remain selectable (see `02_Protocol_Reference/inbound_session_sequence.md` Phase 0 init block).
+
+**Earlier documentation correction:** prior notes described `OnAndroidWorkModeChanged` as a single-argument ("6-mode daemon selector 0-5") callback. That matches the arg-1 value alone, but misses that both args are delivered. The callback signature is `(prev_mode, new_mode)` — verify with `grep -E "On(i)?PhoneWorkModeChanged|OnAndroidWorkModeChanged" /tmp/ttyLog` on a live adapter.
+
+### Adapter TTY Logging Conventions (Verified Apr 2026)
+
+**Log file:** `/tmp/ttyLog` (serial debug log, also served by `api.cgi?ttylog`).
+
+**Rotation:** size-bounded via `check_log_size: 524288 byte` — the adapter rotates the file when it reaches **512 KB**. No retention of prior rotations (the old file is truncated, not archived). On-device capture tooling should either stream via `tail -f` (see the `tail_tty.sh` helper in `~/Downloads/Carlink+Carplay_session/`) or pull the file more often than the rotation cadence.
+
+**Dual clock output:** the same log stream mixes two timestamp formats:
+- **UTC 24-hour** — e.g. `[D]2020-01-02 00:08:01.770` (adapter has no RTC; boots to `2020-01-02`)
+- **Local 12-hour AM/PM** — e.g. `06:40:42.534 AM` (used by some daemons like `colorLightDaemon`)
+
+When correlating adapter tty lines to host logcat timestamps, account for this — not every adapter line can be Δ-compared against host time in the same format. The adapter clock also ticks from `2020-01-02 00:00:00` on every cold boot (no NTP, no RTC backup battery), so all absolute timestamps inside a session are **boot-relative**, not wall-clock.
+
+### ARMAndroidAuto Daemon — Session-End Segfault (Observed Apr 2026)
+
+On every observed session termination (6/6 in macOS CarLink 2026-04-20 captures), the `ARMAndroidAuto` daemon produces a reproducible `Segmentation fault` shortly after the host closes USB:
+
+```
+[OpenAuto] [App] waitForUSBDevice iWidth: 1920, iHeight: 1080
+Segmentation fault
+Stop Link Deamon CarPlay
+Stop Link Deamon AndroidAuto
+HU Link Exit, restart
+_hu_link_main start
+```
+
+**Not a user-visible defect**: the ARMadb-driver supervisor's `_hu_link_main` auto-restarts within ~400ms; no core dump is left behind, and the next plug cycle works normally. However, the segfault tail-log is a useful **marker for "last clean session end"** when diagnosing disconnect causes — if this sequence is absent and instead you see `Host No Response` or watchdog traces, the disconnect cause is different (USB timeout, heartbeat loss).
+
+The crash site (`waitForUSBDevice` inside `ARMAndroidAuto`) suggests a double-wait or null-accessory race when USB detach happens while the AA daemon is mid-descriptor-probe. Not currently blocking anything on the host side.
+
 ### Boot Timing Observations (Live Verified Feb 2026)
 
 > Full boot script listing: `01_Firmware_Architecture/initialization.md`
