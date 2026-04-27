@@ -35,8 +35,8 @@ jobs:
 
       - name: Patch applicationId and content provider
         run: |
-          sed -i "s|applicationId = \"zeno.carlink\"|applicationId = \"${{ secrets.APP_ID }}\"|g" app/build.gradle.kts
-          sed -i "s|com.google.android.apps.automotive.templates.host.ClusterIconContentProvider|${{ secrets.APP_ID }}.ClusterIconContentProvider|g" app/src/main/AndroidManifest.xml
+          sed -i -E "s|applicationId = \"[^\"]*\"|applicationId = \"${{ secrets.APP_ID }}\"|g" app/build.gradle.kts
+          sed -i -E "s|[a-zA-Z0-9.]+\.ClusterIconContentProvider|${{ secrets.APP_ID }}.ClusterIconContentProvider|g" app/src/main/AndroidManifest.xml
           NEW_VERSION_CODE=$((200 + ${{ github.run_number }}))
           sed -i "s|versionCode = [0-9]*|versionCode = ${NEW_VERSION_CODE}|g" app/build.gradle.kts
           echo "Applied applicationId: ${{ secrets.APP_ID }}, versionCode: ${NEW_VERSION_CODE}"
