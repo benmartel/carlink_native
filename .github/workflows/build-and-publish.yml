@@ -7,6 +7,9 @@ on:
       - master
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-and-publish:
     name: Build Release AAB & Upload to Play Store
@@ -44,16 +47,15 @@ jobs:
           GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g"
 
       - name: Sign AAB
-        uses: r0adkll/sign-android-release@v1
-        id: sign_aab
-        with:
-          releaseDirectory: app/build/outputs/bundle/release
-          signingKeyBase64: ${{ secrets.KEYSTORE_BASE64 }}
-          alias: ${{ secrets.KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-        env:
-          BUILD_TOOLS_VERSION: "34.0.0"
+        run: |
+          jarsigner \
+            -sigalg SHA256withRSA \
+            -digestalg SHA-256 \
+            -keystore $GITHUB_WORKSPACE/release.keystore \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            -keypass "${{ secrets.KEY_PASSWORD }}" \
+            app/build/outputs/bundle/release/app-release.aab \
+            "${{ secrets.KEY_ALIAS }}"
 
       - name: Upload AAB artifact
         if: always()
@@ -64,11 +66,11 @@ jobs:
           retention-days: 14
 
       - name: Upload to Google Play Internal Testing
-        uses: r0adkll/upload-google-play@v1
+        uses: r0adkll/upload-google-play@v3
         with:
           serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
           packageName: ${{ secrets.APP_ID }}
-          releaseFiles: ${{ steps.sign_aab.outputs.signedReleaseFile }}
-          track: internal
+          releaseFiles: app/build/outputs/bundle/release/app-release.aab
+          tracks: internal
           status: completed
           changesNotSentForReview: true
