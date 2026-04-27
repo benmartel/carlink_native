@@ -17,11 +17,7 @@ android {
         applicationId = "zeno.carlink"
         minSdk = 32
         targetSdk = 36
-<<<<<<< HEAD
-        versionCode = 107
-=======
-        versionCode = 103
->>>>>>> 3780e45 (Fix versionCode base to 103 (above current Play Store max of 102))
+        versionCode = 200
         versionName = "1.0.0"
 
 //###############################################
@@ -52,7 +48,7 @@ android {
 
     buildFeatures {
         compose = true
-        buildConfig = true  // Enable BuildConfig generation for debug checks
+        buildConfig = true // Enable BuildConfig generation for debug checks
     }
 
     packaging {
@@ -67,8 +63,8 @@ android {
         // with microphone timing - Timer.scheduleAtFixedRate works reliably.
         // See documents/revisions.txt [19], [21] for history.
         disable += "DiscouragedApi"
-        disable += "Instantiatable"  // CarAppActivity from app-automotive AAR — false positive
-        disable += "InvalidUsesTagAttribute"  // "navigation" is valid for Car App Library nav apps
+        disable += "Instantiatable" // CarAppActivity from app-automotive AAR — false positive
+        disable += "InvalidUsesTagAttribute" // "navigation" is valid for Car App Library nav apps
     }
 }
 
@@ -143,4 +139,3 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
-
