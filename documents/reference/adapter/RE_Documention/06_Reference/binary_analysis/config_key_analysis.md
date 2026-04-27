@@ -1257,6 +1257,32 @@ bool FUN_0002f8bc(void) {
 - Value 2 may fail to establish wideband if the carrier/phone does not support it -- CarPlay will fall back to narrowband.
 - **Web UI bug noted in web_settings_reference.md:** The web UI's "CallQuality" setting does NOT set VoiceQuality simultaneously. These are independent keys despite similar names.
 
+### Live Test Results (2026-04-10)
+
+Tested on CPC200-CCPA firmware 2025.10 with iPhone CarPlay session, values set via `riddleBoxCfg -s` with adapter reboot between each test.
+
+| CallQuality | VoiceQuality | Siri receive | Siri mic (INPUT_CONFIG) | Phone call receive | Phone call mic | Adapter mic input |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 16kHz/1ch | decodeType=5 (16kHz) | 16kHz/1ch | decodeType=5 (16kHz) | OK (640B frames) |
+| 2 | 1 | 16kHz/1ch | decodeType=5 (16kHz) | 16kHz/1ch | **decodeType=6 (24kHz)** | **BROKEN** — `Pop input Audio buffer not enough: 640!` |
+| 2 | 2 | **24kHz/1ch** | decodeType=6 (24kHz) | **24kHz/1ch** | decodeType=6 (24kHz) | BROKEN |
+| 1 | 2 | 24kHz/1ch | decodeType=6 (24kHz) | 16kHz/1ch | decodeType=5 (16kHz) | BROKEN (Siri path sends 960B) |
+
+**Key findings:**
+- `CallQuality` controls phone call mic format (INPUT_CONFIG decodeType for telephony)
+- `VoiceQuality` controls Siri/speech mic format (INPUT_CONFIG decodeType for voice recognition)
+- Both also affect **received** audio — iPhone sends 24kHz when adapter requests it
+- Value 2 (24kHz) is half-implemented: adapter negotiates 24kHz with iPhone successfully, but AirPlay `AudioStream` input buffer is hardcoded at 640 bytes (16kHz × 20ms × 2B). 24kHz sends 960B frames → adapter drops every mic packet
+- The host app (carlink_native) dynamically adjusts mic capture rate from INPUT_CONFIG — confirmed sending 24kHz correctly. The bottleneck is entirely adapter-side.
+
+### CMD_BOX_INFO Transform Bug
+
+CallQuality is NOT in the CMD_BOX_INFO transform table (`fcn.00016ee0` at 0x16ee0 in ARMadb-driver). The host app sends `"CallQuality":1` in the JSON but the firmware logs:
+```
+[E] apk CallQuality value transf box value error , please check!
+```
+The transform table at `0x91c5e` contains 28 camelCase→PascalCase pairs. CallQuality is missing. See "CMD_BOX_INFO Transform Table" section below for the complete table.
+
 ---
 
 
@@ -1304,6 +1330,86 @@ bool FUN_0002f8a4(void) {
 - Only affects CarPlay Siri/voice, not phone calls (that's CallQuality).
 - **Not web-settable** -- this is a "hidden" config key. Must be edited manually in `/data/riddle.conf` on the device.
 - The distinction between CallQuality and VoiceQuality is that phone calls use telephony codecs (AMR-WB for wideband) while Siri uses AAC-ELD. VoiceQuality controls the AAC-ELD bitrate/sample-rate negotiation.
+
+### CMD_BOX_INFO Transform Bug
+
+VoiceQuality is NOT in the CMD_BOX_INFO transform table. Same bug as CallQuality — the host sends `"VoiceQuality":1` but the firmware logs:
+```
+[E] apk VoiceQuality value transf box value error , please check!
+```
+Only settable via `riddleBoxCfg -s VoiceQuality <value>` directly on the adapter. No CGI endpoint either.
+
+### ARMadb-driver Runtime Addresses (2026-04-10 disassembly)
+
+| What | Address | Notes |
+|------|---------|-------|
+| CallQuality runtime value | `0x91d48` | Dual-purpose: config value at startup, overwritten by audio format during streaming (at `0x2012a`) |
+| VoiceQuality runtime value | `0x91d4c` | Read at `0x1a350` during SIRI_START |
+| VoiceQuality reader (SIRI_START) | `0x1a350` | value==2 → decodeType 5 (16kHz), else → decodeType 3 (8kHz) |
+| CallQuality reader (iAP2 IPC) | `0x1a948` | Sends raw value as field[0] in audio signal IPC to ARMiPhoneIAP2 |
+| 24kHz audio path | `0x1f676` | Phone call handler cmd=4: sets decodeType=6, sampleRate=24000 |
+| INPUT_CONFIG handler | `0x1f5be` | Defaults to decodeType=5 (16kHz); modified by quality settings |
+
+---
+
+
+### CMD_BOX_INFO Transform Table (fcn.00016ee0 in ARMadb-driver)
+
+The `CMD_BOX_INFO` handler at `0x16ee0` processes the JSON from the host app via two mechanisms:
+
+**1. Hardcoded strcmp handlers** (case-sensitive, with side effects):
+
+| JSON Key | Action |
+|----------|--------|
+| `syncTime` | System clock sync |
+| `brand` | Brand identity |
+| `btName` | → `CustomBluetoothName` via riddleBoxCfg |
+| `wifiName` | → `CustomWifiName` via riddleBoxCfg |
+| `WiFiChannel` | → riddleBoxCfg + **executes wifi restart script** |
+| `mediaVol`, `callVol`, `speechVol`, `ringVol`, `navVol`, `otherVol` | Volume controls |
+
+**2. Generic transform table** (28 entries at `0x91c5e`, camelCase→PascalCase):
+
+| camelCase (JSON) | PascalCase (riddleBoxCfg) |
+|---|---|
+| `btName` | `CustomBluetoothName` |
+| `wifiName` | `CustomWifiName` |
+| `fps` | `CustomFrameRate` |
+| `gps` | `HudGPSSwitch` |
+| `lang` | `BoxConfig_UI_Lang` |
+| `bgMode` | `BackgroundMode` |
+| `syncMode` | `iAP2TransMode` |
+| `startDelay` | `BoxConfig_DelayStart` |
+| `mediaDelay` | `MediaLatency` |
+| `mediaSound` | `MediaQuality` |
+| `autoConn` | `NeedAutoConnect` |
+| `androidWorkMode` | `AndroidWorkMode` |
+| `drivePosition` | `CarDrivePosition` |
+| `echoDelay` | `EchoLatency` |
+| `androidAutoSizeW` | `AndroidAutoWidth` |
+| `androidAutoSizeH` | `AndroidAutoHeight` |
+| `screenPhysicalW` | `ScreenPhysicalW` |
+| `screenPhysicalH` | `ScreenPhysicalH` |
+| `CarBrand` | `CarBrand` |
+| `ScreenDPI` | `ScreenDPI` |
+| `boxName` | `CustomBoxName` |
+| `UseBTPhone` | `UseBTPhone` |
+| `HiCarConnectMode` | `HiCarConnectMode` |
+| `GNSSCapability` | `GNSSCapability` |
+| `AutoResetUSB` | `AutoResetUSB` |
+| `DashboardInfo` | `DashboardInfo` |
+
+Keys NOT in either path → error log + silently discarded:
+
+| JSON Key | Why it fails | Notes |
+|---|---|---|
+| `CallQuality` | Missing from table | riddleBoxCfg key exists, never wired to transform |
+| `VoiceQuality` | Missing from table | riddleBoxCfg key exists, never wired to transform |
+| `autoPlay` | Missing from table | Actual key is `AutoPlauMusic` (firmware typo). server.cgi has its own parallel mapping that works. |
+| `wifiChannel` (lowercase) | Missing from hardcoded handlers | `WiFiChannel` (capital W) works via hardcoded handler. Lowercase falls to generic path where `strcasecmp` persists value but skips wifi restart. |
+| `OemName` | Missing from table | Persists to `oemName` in riddle.conf via strcasecmp generic path, but nothing reads it. BOX_INFO OEM name comes from `/etc/airplay.conf` oemIconLabel. |
+
+**Note:** The generic path's `riddleBoxCfg -s` calls use `strcasecmp` for key lookup, so keys that fail the transform lookup but have a matching riddleBoxCfg entry (like `wifiChannel` → `WiFiChannel`) still get persisted — they just miss any side effects (e.g., wifi restart script) that only run from hardcoded handlers.
 
 ---
 

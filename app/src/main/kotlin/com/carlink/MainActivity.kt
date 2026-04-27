@@ -46,6 +46,8 @@ import com.carlink.logging.LoggingPreferences
 import com.carlink.logging.apply
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
+import com.carlink.media.MediaSessionManager
+import com.carlink.util.LogCallback
 import com.carlink.navigation.NavigationStateManager
 import com.carlink.protocol.AdapterConfig
 import com.carlink.protocol.KnownDevices
@@ -64,19 +66,72 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Main Activity - Entry Point for Carlink Native
+ * Main Activity — Entry Point for Carlink Native.
+ *
+ * The sole Activity in the app; owns every long-lived session object.
  *
  * Responsibilities:
- * - App initialization and lifecycle management
- * - Permission handling (microphone, USB)
- * - Immersive fullscreen mode for automotive display
- * - Navigation between main projection and settings
+ *  - Boot sequencing (logging → cluster component toggle → display mode → deferred
+ *    CarlinkManager init) on the main thread.
+ *  - Ownership of [CarlinkManager] and [FileLogManager] (nullable to survive being
+ *    destroyed before init completes).
+ *  - Runtime permission chain (mic → location; Android system dialogs are sequential,
+ *    so the mic callback triggers the location request rather than firing in parallel).
+ *  - Display-mode policy: four [DisplayMode] branches control system-bar visibility,
+ *    cutout clipping, and SafeArea metadata. See [applyDisplayMode] + [initializeCarlinkManager].
+ *  - In-place session reinit on display-mode change via [reinitializeForDisplayMode]
+ *    (tier-2 restart; replaces the historical Process.killProcess approach).
+ *  - USB attach (onNewIntent, via manifest intent-filter) + detach (BroadcastReceiver)
+ *    handling for faster disconnect detection than USB-transfer error paths provide.
+ *  - Cluster binding lifecycle: [launchCarAppActivity] starts the Templates Host →
+ *    cluster chain, [restartClusterBinding] tears it down and re-establishes.
+ *  - Compose UI host: the top-level [CarlinkApp] composable keeps [MainScreen]
+ *    continuously composed (to preserve the VideoSurface / HWC plane) and slides
+ *    [SettingsScreen] on top via AnimatedVisibility rather than replacing it.
  */
 class MainActivity : ComponentActivity() {
     // Nullable to prevent UninitializedPropertyAccessException if Activity
     // is destroyed before initialization completes (e.g., low memory kill)
     private var carlinkManager: CarlinkManager? = null
     private var fileLogManager: FileLogManager? = null
+
+    /**
+     * App-scope MediaSession. Created lazily on the first tier-2 rebuild that selects
+     * ADAPTER audio mode, reused across every subsequent rebuild, and released exactly
+     * once from [onDestroy].
+     *
+     * Ownership lives HERE — not inside [CarlinkManager] — specifically so the underlying
+     * Media3 [androidx.media3.session.MediaLibrarySession] and its platform session token
+     * survive tier-2 CarlinkManager rebuilds (Apply in AdapterConfigurationDialog /
+     * display-mode changes). A new session token on each rebuild causes AOSP CarLauncher's
+     * MediaControllerCompat to receive `onSessionDestroyed` without rebinding, which
+     * blanks the homescreen Media card until a full package uninstall+reinstall. See
+     * [MediaSessionManager] KDoc "KNOWN OS DEFICIENCY" and the 2026-04-23 diagnostics
+     * snapshot diff in `/Users/zeno/Downloads/carlink_diagnostics/` for the full analysis.
+     *
+     * Writes happen on the main thread inside [initializeCarlinkManager] and [onDestroy].
+     */
+    private var mediaSessionManager: MediaSessionManager? = null
+
+    /**
+     * LogCallback routed to the app's [com.carlink.logging.Logger] + any active file log.
+     * Passed to [MediaSessionManager] so its lifecycle events surface through the same
+     * infrastructure that [CarlinkManager] uses. Stable singleton — one instance per
+     * Activity lifetime, safe to share across rebuilds.
+     */
+    private val mediaSessionLogCallback =
+        object : LogCallback {
+            override fun log(message: String) {
+                logInfo(message, tag = "MEDIA_SESSION")
+            }
+
+            override fun log(tag: String, message: String) {
+                logInfo(message, tag = tag)
+            }
+        }
+    // Main-thread-only invariant: written in reinitializeForDisplayMode() and read from
+    // initializeCarlinkManager()/onResume(). Both sides dispatch on the main thread
+    // (decorView.post, postDelayed, lifecycle callbacks), so no @Volatile needed.
     private var currentDisplayMode: DisplayMode = DisplayMode.SYSTEM_UI_VISIBLE
 
     // Observable state for Compose — replacement triggers recomposition of CarlinkApp
@@ -95,6 +150,11 @@ class MainActivity : ComponentActivity() {
             logInfo("Location permission ${if (isGranted) "granted" else "denied"}", tag = "MAIN")
         }
 
+    // Android permission dialogs are sequential, not overlappable — launching both
+    // in parallel would drop the second. The mic callback triggers location, and
+    // both denials are survivable: CarlinkManager still constructs; mic features
+    // (Siri, AA voice, phone call capture) fail silently, and GPS forwarding
+    // (AdapterConfig.gpsForwarding) is a no-op without ACCESS_FINE_LOCATION.
     private val micPermissionLauncher =
         registerForActivityResult(
             ActivityResultContracts.RequestPermission(),
@@ -108,10 +168,9 @@ class MainActivity : ComponentActivity() {
      * BroadcastReceiver for USB device detachment events.
      *
      * Provides immediate detection when the Carlinkit adapter is physically
-     * disconnected, enabling faster recovery than waiting for USB transfer errors.
-     *
-     * Neither the original carlink nor early carlink_native versions had this —
-     * both relied on transfer error detection for physical disconnection.
+     * disconnected, enabling faster recovery than waiting for USB transfer errors
+     * to surface. Filters to known Carlinkit VID/PID pairs before signaling
+     * [CarlinkManager.onUsbDeviceDetached] — other USB device events are ignored.
      */
     private val usbDetachReceiver =
         object : BroadcastReceiver() {
@@ -164,9 +223,18 @@ class MainActivity : ComponentActivity() {
         // other modes use usable area excluding visible system bars
         loadAndApplyDisplayMode()
 
-        // Initialize Carlink manager (must be AFTER immersive mode is applied)
-        // so display dimensions are calculated correctly for the active mode
-        initializeCarlinkManager()
+        // Defer CarlinkManager creation to the next main-looper tick so the WM has
+        // processed the decorFitsSystemWindows + layoutInDisplayCutoutMode flags set
+        // in applyDisplayMode(). currentWindowMetrics.bounds then reflects the
+        // post-clip rect (e.g. 2400x788 in SYSTEM_UI_VISIBLE on a 2400x960 display)
+        // on the very first read, eliminating the cold-start surface-size race.
+        // Compose renders `if (manager != null)` while we wait, so the UI boots with
+        // the loading overlay and swaps in as soon as the manager is ready.
+        window.decorView.post {
+            if (!isDestroyed && !isFinishing) {
+                initializeCarlinkManager()
+            }
+        }
 
         // Request permissions if needed (location is chained after mic dialog)
         requestMicrophonePermission()
@@ -201,6 +269,11 @@ class MainActivity : ComponentActivity() {
                             displayMode = displayMode,
                             onResetCluster = ::restartClusterBinding,
                             onReinitForDisplayMode = ::reinitializeForDisplayMode,
+                            // Reset Connection now rebuilds the full manager via the same
+                            // path display-mode changes use. Turns a probabilistic repair
+                            // into a deterministic one: new SurfaceView, fresh HWC plane,
+                            // fresh WindowMetrics, renegotiated Open() — every time.
+                            onResetConnection = { reinitializeForDisplayMode(currentDisplayMode) },
                         )
                     }
                 }
@@ -264,8 +337,17 @@ class MainActivity : ComponentActivity() {
         // Unregister USB detachment receiver
         unregisterUsbDetachReceiver()
 
-        // Release resources (null-safe in case Activity destroyed before init completed)
+        // Release resources (null-safe in case Activity destroyed before init completed).
+        //
+        // Order: CarlinkManager first (it detaches its transport callback from the
+        // MediaSession but does NOT release it — see CarlinkManager.release KDoc),
+        // THEN the app-scope MediaSessionManager. This is the one and only correct
+        // place to release the MediaSession: at full Activity teardown. Releasing it
+        // earlier (e.g. on a tier-2 rebuild) triggers the blank-homescreen-card bug
+        // documented in MediaSessionManager "KNOWN OS DEFICIENCY".
         carlinkManager?.release()
+        mediaSessionManager?.release()
+        mediaSessionManager = null
         fileLogManager?.release()
 
         logInfo("MainActivity destroyed", tag = "MAIN")
@@ -412,12 +494,15 @@ class MainActivity : ComponentActivity() {
                 Pair(userConfig.videoResolution.width, userConfig.videoResolution.height)
             }
 
-        // Build binary ViewArea/SafeArea data using the configured resolution
-        // ViewArea/SafeArea must match OPEN message dimensions (safeArea ⊆ viewArea ⊆ display)
+        // Build binary ViewArea/SafeArea data using the configured resolution.
+        // ViewArea/SafeArea must match OPEN message dimensions (safeArea ⊆ viewArea ⊆ display).
         val viewAreaData = buildViewAreaData(configWidth, configHeight)
         val safeAreaData =
             if (userSelectedResolution) {
-                // Scale cutout insets from display coordinates to custom resolution coordinates
+                // Scale cutout insets from display coordinates to custom resolution coordinates.
+                // Linear scaling assumes cutouts are rectangular window-edge margins (true on
+                // AAOS displays we've seen). Non-uniform X/Y scaling is OK here because cutout
+                // insets are axis-aligned.
                 val scaleX = configWidth.toFloat() / evenWidth.toFloat()
                 val scaleY = configHeight.toFloat() / evenHeight.toFloat()
                 buildSafeAreaData(
@@ -494,9 +579,67 @@ class MainActivity : ComponentActivity() {
             tag = "MAIN",
         )
 
-        carlinkManager = CarlinkManager(this, config)
+        applyAudioTransferModeToMediaSession(config.audioTransferMode)
+
+        carlinkManager = CarlinkManager(this, config, mediaSessionManager)
         carlinkManagerState.value = carlinkManager
         displayModeState.value = currentDisplayMode
+    }
+
+    /**
+     * Lifecycle-manage the app-scope [MediaSessionManager] based on the new config's
+     * `audioTransferMode`. The session is created once (on first ADAPTER-mode init),
+     * reused across every subsequent tier-2 rebuild, and released only when the
+     * user toggles to BLUETOOTH (at which point we don't want Carlink advertising
+     * as an AAOS media source) or from [onDestroy]. Crucially, a same-mode rebuild
+     * leaves the session untouched — that's the whole point of the revision [122]
+     * ownership refactor.
+     *
+     * Extracted from [initializeCarlinkManager] in the 2026-04-23 static-analysis
+     * cleanup (F7) to give the MediaSession lifecycle concern a discoverable name.
+     * No behavior change vs. the prior inline block.
+     *
+     * @param audioTransferMode `false` = ADAPTER (audio routed via USB, media session
+     *   active), `true` = BLUETOOTH (audio via phone BT, no media session).
+     */
+    private fun applyAudioTransferModeToMediaSession(audioTransferMode: Boolean) {
+        if (!audioTransferMode) {
+            if (mediaSessionManager == null) {
+                try {
+                    // Pass applicationContext (not `this`) so the MediaSessionManager's
+                    // stored Context reference — held across its companion-object
+                    // currentInstance pointer (MediaSessionManager.kt:886-892) — is
+                    // process-scoped rather than Activity-scoped. Eliminates the
+                    // StaticFieldLeak Lint warning without suppression. The Context
+                    // is used for FileProvider URI grants, cacheDir access, and
+                    // building a PendingIntent.getActivity(ctx, …, Intent(ctx, MainActivity::class)) —
+                    // all of which accept applicationContext.
+                    mediaSessionManager =
+                        MediaSessionManager(applicationContext, mediaSessionLogCallback).apply {
+                            initialize()
+                        }
+                    logInfo(
+                        "[MEDIA_SESSION] App-scope MediaSessionManager created (ADAPTER mode)",
+                        tag = "MAIN",
+                    )
+                } catch (e: Exception) {
+                    // Fail-open: if MediaSession init fails we continue without AAOS media
+                    // integration (USB + projection still work). Matches the pre-refactor
+                    // fail-open behavior — just scoped up a level.
+                    logWarn(
+                        "[MEDIA_SESSION] init failed — running without AAOS media integration: ${e.message}",
+                        tag = "MAIN",
+                    )
+                    mediaSessionManager = null
+                }
+            }
+        } else {
+            mediaSessionManager?.let {
+                logInfo("[MEDIA_SESSION] Audio mode switched to BLUETOOTH — releasing session", tag = "MAIN")
+                it.release()
+            }
+            mediaSessionManager = null
+        }
     }
 
     /**
@@ -563,8 +706,11 @@ class MainActivity : ComponentActivity() {
         applyDisplayMode(newMode)
         logInfo("[DISPLAY_REINIT] Applied display mode: ${newMode.name}", tag = "MAIN")
 
-        // 3. Allow a frame for WindowMetrics to stabilize after bar visibility change,
-        //    then rebuild CarlinkManager with fresh resolution.
+        // 3. Wait for system-bar animation + WindowMetrics to settle after bar visibility
+        //    change, then rebuild CarlinkManager with fresh resolution. 200ms (not the
+        //    more naive "one frame" = 16ms) covers the animated system-bar transition
+        //    (typically 100–150ms on AAOS) plus the async WM attribute-change propagation
+        //    triggered by `window.attributes = lp` in applyDisplayMode().
         val reinitRunnable = Runnable {
             if (!isDestroyed && !isFinishing) {
                 logInfo("[DISPLAY_REINIT] Rebuilding CarlinkManager with new metrics", tag = "MAIN")
@@ -654,6 +800,11 @@ class MainActivity : ComponentActivity() {
     /**
      * Loads display mode preference and applies it.
      * Uses synchronous SharedPreferences cache to avoid ANR.
+     *
+     * No try/catch: a SharedPreferences read exception here would propagate through
+     * onCreate and crash the Activity. Low probability (the file is tiny and local),
+     * but a failure path exists. The read's default is `DisplayMode.SYSTEM_UI_VISIBLE`
+     * (see DisplayModePreference.getDisplayModeSync), matching the field initializer.
      */
     private fun loadAndApplyDisplayMode() {
         // Read preference from sync cache (instant, no I/O blocking)
@@ -672,15 +823,26 @@ class MainActivity : ComponentActivity() {
      */
     private fun applyDisplayMode(mode: DisplayMode) {
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
+        val lp = window.attributes
 
         when (mode) {
             DisplayMode.SYSTEM_UI_VISIBLE -> {
-                // Show all system bars - let AAOS manage display bounds
+                // WM clips window content rect to between-bars region *before* view tree is
+                // inflated. SurfaceView is born at correct geometry; no HWC-plane race.
+                WindowCompat.setDecorFitsSystemWindows(window, true)
+                lp.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                window.attributes = lp
                 windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
             }
 
             DisplayMode.STATUS_BAR_HIDDEN -> {
-                // Hide status bar only, keep navigation bar visible
+                // Edge-to-edge: video extends into hidden-bar + cutout regions.
+                // SafeArea metadata tells the phone to keep clickable UI out of those zones.
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                lp.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                window.attributes = lp
                 windowInsetsController.hide(WindowInsetsCompat.Type.statusBars())
                 windowInsetsController.show(WindowInsetsCompat.Type.navigationBars())
                 windowInsetsController.systemBarsBehavior =
@@ -688,7 +850,10 @@ class MainActivity : ComponentActivity() {
             }
 
             DisplayMode.NAV_BAR_HIDDEN -> {
-                // Hide navigation bar only, keep status bar visible
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                lp.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                window.attributes = lp
                 windowInsetsController.show(WindowInsetsCompat.Type.statusBars())
                 windowInsetsController.hide(WindowInsetsCompat.Type.navigationBars())
                 windowInsetsController.systemBarsBehavior =
@@ -696,7 +861,10 @@ class MainActivity : ComponentActivity() {
             }
 
             DisplayMode.FULLSCREEN_IMMERSIVE -> {
-                // Hide all system bars for maximum projection area
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                lp.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                window.attributes = lp
                 windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
                 windowInsetsController.systemBarsBehavior =
                     WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -725,9 +893,17 @@ class MainActivity : ComponentActivity() {
      * Combined with taskAffinity="zeno.carlink.templates" and singleTask launch mode,
      * this opens in its own task stack without disturbing MainActivity.
      *
-     * Guarded by ClusterBindingState.sessionAlive — only launches if no live session exists.
-     * RendererServiceBinder.terminate() can kill the session on USB re-enumeration,
-     * so this must be callable from both onCreate() and onNewIntent().
+     * Guarded by [ClusterBindingState.sessionAlive] — only launches if no live session
+     * exists. The cluster session can be torn down by the Templates Host / Car App Host
+     * around USB re-enumeration (the specific "RendererServiceBinder.terminate()"
+     * mechanism previously cited in comments is not present in this repo — treat the
+     * teardown as black-box Host behavior). Must therefore be callable from both
+     * onCreate() and onNewIntent().
+     *
+     * Post-launch, re-elevates MainActivity with FLAG_ACTIVITY_REORDER_TO_FRONT after
+     * 1s. That 1s is the upper-bound pinned by [ClusterMainSession.RelayScreen]'s KDoc
+     * ("visible for ~1s before MainActivity returns to front") — change here and the
+     * RelayScreen duration changes too.
      */
     private fun launchCarAppActivity() {
         if (ClusterBindingState.sessionAlive) {
@@ -770,6 +946,11 @@ class MainActivity : ComponentActivity() {
     /**
      * Tears down the cluster binding chain and re-establishes it.
      * Clears nav state → kills CarAppActivity task → waits for teardown → relaunches.
+     *
+     * [ActivityManager.getAppTasks] returns only the calling package's tasks, so the
+     * CarAppActivity match is guaranteed to be ours. `singleTask` on the manifest
+     * declaration guarantees at most one matching task — the `break` after first match
+     * is intentional.
      */
     fun restartClusterBinding() {
         logWarn("[CLUSTER] restartClusterBinding() — tearing down and re-establishing binding chain", tag = "MAIN")
@@ -829,7 +1010,12 @@ fun CarlinkApp(
     displayMode: DisplayMode,
     onResetCluster: () -> Unit,
     onReinitForDisplayMode: (DisplayMode) -> Unit = {},
+    onResetConnection: () -> Unit = {},
 ) {
+    // Survives normal recomposition via remember{}, but discarded on manager rebuild
+    // because CarlinkApp itself is gated by `if (manager != null)` at the Activity
+    // setContent — tier-2 reinit disposes the whole composable, so every reinit
+    // lands back in MainScreen regardless of prior overlay state. Intentional UX.
     var showSettings by remember { mutableStateOf(false) }
 
     // Log screen changes and recover video when overlay closes.
@@ -860,6 +1046,7 @@ fun CarlinkApp(
                 logInfo("[UI_NAV] Opening SettingsScreen overlay (video continues)", tag = "UI")
                 showSettings = true
             },
+            onResetConnection = onResetConnection,
         )
 
         // SettingsScreen slides in ON TOP of MainScreen

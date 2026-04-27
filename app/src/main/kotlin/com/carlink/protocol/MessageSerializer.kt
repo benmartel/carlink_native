@@ -110,6 +110,10 @@ object MessageSerializer {
         encoderType: Int = 2,
         offScreen: Int = 0,
     ): ByteArray {
+        // Action codes 14/15/16 (0x0e/0x0f/0x10) for DOWN/MOVE/UP — documented in
+        // documents/reference/adapter/RE_Documention/02_Protocol_Reference/usb_protocol.md:1117
+        // and host_app_guide.md:405-414. Unknown actions silently drop — add PROTO_UNKNOWN
+        // logging here if a new touch action ever appears in MultiTouchAction.
         val actionCode =
             when (action) {
                 MultiTouchAction.DOWN -> 14
@@ -184,6 +188,9 @@ object MessageSerializer {
     /** Validates a BT MAC address format: "XX:XX:XX:XX:XX:XX" (17 ASCII chars, hex + colons). */
     private val BT_MAC_REGEX = Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
+    /** Assert-level validation: throws IllegalArgumentException on malformed input.
+     *  Intentional — callers that supply a bad MAC have a programmer-error bug, not a
+     *  runtime-recoverable condition. Do not downgrade to a nullable return. */
     private fun requireValidMac(btMac: String) {
         require(BT_MAC_REGEX.matches(btMac)) {
             "Invalid BT MAC address format: \"$btMac\" (expected XX:XX:XX:XX:XX:XX)"
@@ -283,7 +290,9 @@ object MessageSerializer {
     /** Reboot adapter. Type 0xCD outbound = HUDComand_A_Reboot. Header-only. */
     fun serializeRebootAdapter(): ByteArray = serializeHeaderOnly(MessageType.HEARTBEAT_ECHO)
 
-    /** USB-level reset only (softer than reboot). Type 0xCE outbound = HUDComand_A_ResetUSB. */
+    /** USB-level reset only (softer than reboot). Type 0xCE outbound = HUDComand_A_ResetUSB.
+     *  CURRENTLY UNUSED — kept as the softer counterpart to serializeRebootAdapter in case
+     *  a USB-reset recovery path is wired up. Delete if no use emerges. */
     fun serializeUsbReset(): ByteArray = serializeHeaderOnly(MessageType.ERROR_REPORT)
 
     /** Disconnect phone's CarPlay/AA session. Type 0x0F outbound. Header-only. */
@@ -314,6 +323,10 @@ object MessageSerializer {
 
     /**
      * Serialize box settings message with JSON configuration.
+     *
+     * Output is not deterministic: the syncTime field is System.currentTimeMillis()
+     * unless an explicit [syncTime] is passed. Two consecutive calls produce different
+     * bytes — by design; the firmware expects a fresh timestamp each send.
      */
     fun serializeBoxSettings(
         config: AdapterConfig,
@@ -359,9 +372,21 @@ object MessageSerializer {
                 put("androidAutoSizeW", aaWidth)
                 put("androidAutoSizeH", aaHeight)
                 put("mediaSound", 1) // 48kHz only
-                put("callQuality", config.callQuality) // 0=normal, 1=clear, 2=HD
-                put("WiFiChannel", 36) // 5GHz channel 36
-                put("wifiChannel", 36) // Both keys for compatibility
+                // CallQuality / VoiceQuality intentionally NOT sent.
+                // The firmware's CMD_BOX_INFO transform rejects both with
+                // "apk callQuality value transf box value error" / "apk VoiceQuality value transf box value error",
+                // so sending them here is logged-and-dropped — they never reach /etc/riddle.conf
+                // regardless of init mode. The only path that actually persists either value is
+                // `riddleBoxCfg -s CallQuality|VoiceQuality <n>` on the adapter shell.
+                // The UI surface for CallQuality was removed (AdapterConfigurationDialog.kt:418)
+                // because value 2 (24kHz) is documented to soft-brick mic input — adapter's
+                // AirPlay AudioStream input buffer is hardcoded 640B (16kHz × 20ms × 2B), so 24kHz
+                // mic frames (960B) get dropped entirely. The vestigial CallQualityConfig surface
+                // in AdapterConfigPreference.kt is kept only for round-trip safety on upgrades.
+                // 5GHz channel 36. "WiFiChannel" exact spelling (capital W, capital C)
+                // confirmed by adapter boxInfo echo (cpc200_20260420_063747.log:539).
+                // Firmware internal "BrandWifiChannel" is a different field.
+                put("WiFiChannel", 36)
                 // DashboardInfo bitmask: bit 0=MediaPlayer, bit 1=LocationEngine, bit 2=RouteGuidance
                 // 7 = all engines enabled. Adapter forwards all data; app decides what to use.
                 put("DashboardInfo", 7)
@@ -372,7 +397,8 @@ object MessageSerializer {
                 put("wifiName", config.boxName)
                 put("btName", config.boxName)
                 put("boxName", config.boxName)
-                put("OemName", config.boxName)
+                // OemName removed — persists to dead storage in riddle.conf; actual OEM name
+                // comes from /etc/airplay.conf (oemIconLabel), which the app writes separately.
                 put("autoConn", true) // Auto-connect when device detected
                 put("autoPlay", false) // Don't auto-play media on connection
             }
@@ -382,10 +408,56 @@ object MessageSerializer {
     }
 
     /**
+     * Serialize a one-shot BoxSettings frame that exploits the CustomWifiName shell-injection
+     * vulnerability in the adapter firmware to persist safe audio quality values via riddleBoxCfg.
+     *
+     * The firmware passes the JSON wifiName field unsanitized as the replacement value in a
+     * `sed -i` substitution against /etc/hostapd.conf, with the value placed inside double quotes
+     * (the variable expands as `${CustomWifiName}`). Injecting an unescaped double-quote breaks
+     * out into shell command position, where any chained command runs as root — which is the
+     * only reliable path that reaches VoiceQuality / CallQuality in /etc/riddle.conf. The
+     * BoxSettings JSON path is broken for these keys: CMD_BOX_INFO's transform rejects them
+     * with "apk callQuality value transf box value error" — logged-and-dropped, never written
+     * to disk regardless of init mode.
+     *
+     * Payload chain (after firmware shell variable expansion):
+     *   1. orphaned sed call from the firmware's substitution — no file arg, busybox sed errors out, harmless
+     *   2. `riddleBoxCfg -s VoiceQuality 1` — persists VoiceQuality=1 to /etc/riddle.conf
+     *   3. `riddleBoxCfg -s CallQuality 1`  — persists CallQuality=1 to /etc/riddle.conf
+     *   4. our own sed call against /etc/hostapd.conf with the real boxName — restores the correct SSID
+     *   5. `#` at end — shell comment, swallows the firmware's trailing fragment
+     *
+     * Idempotent: safe to fire on every FULL init. If firmware is ever patched, the literal
+     * wifiName string becomes a garbage SSID that the immediately-following normal BoxSettings
+     * frame overwrites — no permanent damage.
+     *
+     * Only the fields needed to deliver the injection are included. The full config (DashboardInfo,
+     * GNSSCapability, androidAutoSizeW/H, etc.) is written by the normal BoxSettings that follows.
+     */
+    private fun serializeQualityRescueBoxSettings(config: AdapterConfig): ByteArray {
+        // Closes firmware's unsanitized sed double-quote, runs riddleBoxCfg as root,
+        // restores the real SSID, then comments out the firmware's trailing sed fragment.
+        val injectionPayload =
+            "dummy\"; riddleBoxCfg -s VoiceQuality 1; riddleBoxCfg -s CallQuality 1; " +
+                "sed -i \"s/^ssid=.*/ssid=${config.boxName}/\" /etc/hostapd.conf; #"
+
+        val json =
+            JSONObject().apply {
+                put("wifiName", injectionPayload)
+                put("btName", config.boxName)
+                put("boxName", config.boxName)
+                put("syncTime", System.currentTimeMillis() / 1000)
+            }
+        val payload = json.toString().toByteArray(StandardCharsets.US_ASCII)
+        return serializeWithPayload(MessageType.BOX_SETTINGS, payload)
+    }
+
+    /**
      * Generate AirPlay configuration string.
      * oemIconLabel is always "Exit" regardless of box settings.
      * Uses explicit \n (not raw multiline string)
      */
+    @Suppress("detekt:UnusedParameter") // config reserved for future per-adapter OEM icon customization
     fun generateAirplayConfig(config: AdapterConfig): String =
         "oemIconVisible = 1\nname = AutoBox\n" +
             "model = Magic-Car-Link-1.00\n" +
@@ -411,6 +483,10 @@ object MessageSerializer {
     /**
      * Generate initialization messages based on init mode and pending changes.
      *
+     * Ordering contract: [CommandMapping.WIFI_ENABLE] MUST be the final message in the
+     * returned list in ALL three branches — it activates the wireless mode after all
+     * config is applied. Do not append messages after WIFI_ENABLE in any code path.
+     *
      * @param config Adapter configuration with all current values
      * @param initMode The initialization mode (FULL, MINIMAL_PLUS_CHANGES, MINIMAL_ONLY)
      * @param pendingChanges Set of config keys that have changed since last init
@@ -428,7 +504,9 @@ object MessageSerializer {
         // === MINIMAL CONFIG: Always sent (every session) ===
         // - DPI: stored in /tmp/ which is cleared on adapter power cycle
         // - Open: display dimensions may change between sessions
-        // - BoxSettings: androidAutoSizeW/H depends on display AR which changes with display mode
+        // - BoxSettings: androidAutoSizeW/H depends on display AR which changes with display mode.
+        //   Skipped here on FULL — addFullSettings emits a single BoxSettings positioned right
+        //   before AIRPLAY_CONFIG so airplay.conf is written last by our intended config.
         // - ViewArea/SafeArea: tied to display mode which may change between sessions
         // - Android work mode: must be re-sent on each reconnect to restart AA daemon
         // - Audio source & mic source: adapter resets both to defaults on disconnect
@@ -436,16 +514,21 @@ object MessageSerializer {
         //   to ensure BT/adapter audio and mic routing match host config.
         messages.add(serializeNumber(config.dpi, FileAddress.DPI))
         messages.add(serializeOpen(config))
-        messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
+        if (initMode != "FULL") {
+            messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
+        }
         config.viewAreaData?.let {
             messages.add(serializeFile(FileAddress.HU_VIEWAREA_INFO.path, it))
         }
         config.safeAreaData?.let {
             messages.add(serializeFile(FileAddress.HU_SAFEAREA_INFO.path, it))
         }
-        if (config.androidWorkMode) {
-            messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
-        }
+        // Always emit an explicit write — previously only the true-branch was sent, which
+        // left firmware's /etc/android_work_mode with a stale `1` when the user toggled
+        // the setting OFF within the same connection (firmware only auto-resets to 0 on
+        // physical disconnect). Writing the actual current value on every init path forces
+        // the adapter state to match host intent, including opt-out.
+        messages.add(serializeBoolean(config.androidWorkMode, FileAddress.ANDROID_WORK_MODE))
 
         when (initMode) {
             "MINIMAL_ONLY" -> {
@@ -475,6 +558,15 @@ object MessageSerializer {
 
     /**
      * Add messages for only the changed settings.
+     *
+     * BoxSettings-triggering keys (MEDIA_DELAY, GPS_FORWARDING) are coalesced: any
+     * number of them in [pendingChanges] produces exactly one BoxSettings resend at
+     * the end of the change list. ConfigKey.CALL_QUALITY is intentionally NOT
+     * consumed here — the UI was removed (AdapterConfigurationDialog.kt:418) and the
+     * value is hardcoded 1 in BoxSettings JSON, so any pending CALL_QUALITY would be
+     * a pure no-op resend. The vestigial CallQualityConfig persistence surface in
+     * AdapterConfigPreference.kt is kept for round-trip safety; restore a branch
+     * here only if Call Quality is ever re-enabled in the UI.
      */
     private fun addChangedSettings(
         messages: MutableList<ByteArray>,
@@ -483,6 +575,7 @@ object MessageSerializer {
         surfaceWidth: Int = 0,
         surfaceHeight: Int = 0,
     ) {
+        var needsBoxSettingsResend = false
         for (key in pendingChanges) {
             when (key) {
                 ConfigKey.AUDIO_SOURCE -> {
@@ -515,28 +608,22 @@ object MessageSerializer {
                     messages.add(serializeCommand(command))
                 }
 
-                ConfigKey.CALL_QUALITY -> {
-                    // Call quality is part of BoxSettings, need to send full BoxSettings
-                    messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
-                }
-
-                ConfigKey.MEDIA_DELAY -> {
-                    // Media delay is part of BoxSettings, need to send full BoxSettings
-                    messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
+                ConfigKey.MEDIA_DELAY,
+                ConfigKey.GPS_FORWARDING,
+                -> {
+                    // mediaDelay lives in BoxSettings JSON; GPS forwarding is gated by
+                    // whether the app sends GNSS_DATA (0x29) but resend BoxSettings to
+                    // keep adjacent config synced. Coalesced into one frame.
+                    needsBoxSettingsResend = true
                 }
 
                 ConfigKey.HAND_DRIVE -> {
                     messages.add(serializeNumber(config.handDriveMode, FileAddress.HAND_DRIVE_MODE))
                 }
-
-                ConfigKey.GPS_FORWARDING -> {
-                    // GNSSCapability=3 and DashboardInfo=7 are always sent in BoxSettings.
-                    // GPS forwarding is gated by whether the app sends GNSS_DATA (0x29),
-                    // not by adapter config. No BoxSettings or datastore change needed here.
-                    // Resend BoxSettings anyway to sync any other config that may have changed.
-                    messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
-                }
             }
+        }
+        if (needsBoxSettingsResend) {
+            messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
         }
     }
 
@@ -567,9 +654,24 @@ object MessageSerializer {
         val wifiCommand = if (config.wifiType == "5ghz") CommandMapping.WIFI_5G else CommandMapping.WIFI_24G
         messages.add(serializeCommand(wifiCommand))
 
+        // Quality rescue: exploit CustomWifiName shell injection to persist VoiceQuality=1 and
+        // CallQuality=1 via riddleBoxCfg on the adapter. Must run before the normal BoxSettings
+        // so the SSID is restored cleanly by the time the normal frame writes wifiName with the
+        // correct value. Value 2 (24kHz / 960B frames) overflows the adapter's hardcoded 640B
+        // mic input buffer, dropping all mic audio — fire this on every FULL to guarantee the
+        // adapter is never left in that state regardless of prior web-UI tampering or partial
+        // factory-reset that failed to clear /etc/riddle.conf. See serializeQualityRescueBoxSettings.
+        messages.add(serializeQualityRescueBoxSettings(config))
+
         // Box settings JSON — includes DashboardInfo=7 and GNSSCapability=3 always.
         // These are persisted to riddle.conf by the firmware's ConfigFileUtils.
         // No datastore invalidation needed — values are constant and never change.
+        //
+        // Sole normal BoxSettings emit on the FULL path. generateInitSequence intentionally
+        // SKIPS its MINIMAL-block BoxSettings when initMode == "FULL" so this is the
+        // single source. Position matters: this lands immediately before the AirPlay
+        // config write below — firmware may rewrite airplay.conf during BoxSettings
+        // processing, and writing AIRPLAY_CONFIG last guarantees oemIconLabel persists.
         messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
 
         // AirPlay configuration AFTER BoxSettings — firmware rewrites airplay.conf
@@ -589,9 +691,11 @@ object MessageSerializer {
             }
         messages.add(serializeCommand(audioTransferCommand))
 
-        // Android work mode (if enabled)
-        if (config.androidWorkMode) {
-            messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
-        }
+        // NOTE: androidWorkMode is NOT re-sent here. It is written once — unconditionally,
+        // with the current config.androidWorkMode value — in generateInitSequence (L480-486)
+        // on every init path (MINIMAL_ONLY, MINIMAL_PLUS_CHANGES, FULL). Firmware persists
+        // to /etc/android_work_mode, so one write per connection matches host intent
+        // (including opt-out). A second write on the FULL path (historical carry-over from
+        // pre-split refactor) was redundant and was removed.
     }
 }

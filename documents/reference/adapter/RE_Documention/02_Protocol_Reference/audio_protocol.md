@@ -142,25 +142,30 @@ When payload_len is 13, the final byte is a command:
 |------|-----|------|-------------|------------|------------------|-------------|----------|
 | 1 | 0x01 | OUTPUT_START | 4, 5 | 1, 2 | Media/voice playback beginning | Prepare AudioTrack for the stream | Yes |
 | 2 | 0x02 | OUTPUT_STOP | 4, 5 | 1, 2 | Media/voice playback ending | May stop AudioTrack | Yes |
-| 3 | 0x03 | INPUT_START | 5 | 1 | Mic config from phone | Start microphone capture; configure sample rate/channels | Yes |
-| 4 | 0x04 | INPUT_STOP | 5 | 1 | Mic session ending | Stop microphone capture | Yes |
-| 5 | 0x05 | PHONECALL_START | 5 | 1 | Active phone call connected | Start mic capture, route call audio | Yes |
-| 6 | 0x06 | PHONECALL_STOP | 2, 4 | 2 | Phone call ended / channel clear | Stop mic capture if active; clear channel | Yes |
-| 7 | 0x07 | NAVI_START | 4 | 2 | Navigation audio starting | Duck media volume or route to nav AudioTrack | Yes |
-| 8 | 0x08 | NAVI_STOP | 5 | 1 | Navigation audio stopped / Siri mode | Restore media volume; prepare voice mode | Yes* |
-| 9 | 0x09 | SIRI_START | 5 | 1 | Siri activated / responding | Start mic capture if not already active | Yes |
+| 3 | 0x03 | INPUT_CONFIG | 5 | 1 | Mic config from phone | Configure mic sample rate from decode_type; start capture if voice mode active | Yes |
+| 4 | 0x04 | PHONECALL_START | 5 | 1 | Active phone call connected | Start mic capture, route call audio | Yes |
+| 5 | 0x05 | PHONECALL_STOP | 2, 4 | 1, 2 | Phone call ended / channel clear | Stop mic capture if active; clear channel | Yes |
+| 6 | 0x06 | NAVI_START | 2, 4 | 2 | Navigation audio starting | Duck media volume or route to nav AudioTrack | Yes |
+| 7 | 0x07 | NAVI_STOP | 4 | 2 | Navigation audio prompt ended | Restore media volume | Yes |
+| 8 | 0x08 | SIRI_START | 5 | 1 | Siri activated / responding | Start mic capture if not already active | Yes |
+| 9 | 0x09 | SIRI_STOP | 5 | 1 | Siri session ended | Stop mic capture (unless phone call active) | Yes |
 | 10 | 0x0A | MEDIA_START | 4 | 1 | Media stream opening | Internal state tracking | Yes |
 | 11 | 0x0B | MEDIA_STOP | 2, 4 | 1 | Media stream closing | Internal state tracking | Yes |
-| 12 | 0x0C | ALERT_START | 4 | 1 | System alert sound | Duck media or route alert audio | Yes |
+| 12 | 0x0C | ALERT_START | 4 | 1 | System alert sound (ringtone) | Duck media or route alert audio | Yes |
 | 13 | 0x0D | ALERT_STOP | 4 | 1 | System alert ended | Restore audio routing | Yes |
-| 14 | 0x0E | INCOMING_CALL_INIT | 5 | 1 | Incoming call ringing | Start ring audio routing (distinct from active call) | Yes |
-| 16 | 0x10 | NAVI_COMPLETE | 4 | 2 | Navigation prompt finished | End nav audio, restore routing | Yes |
+| 14 | 0x0E | INCOMING_CALL_INIT | 5 | 1 | Incoming call ringing | Show call notification, prepare ring audio | Yes |
+| 15 | 0x0F | TBT_START | 4 | 2 | Turn-by-turn pre-announcement | Duck media; precedes NAVI_START for voice prompt | Yes |
+| 16 | 0x10 | NAVI_COMPLETE | 4 | 2 | Navigation prompt sequence finished | End nav audio, restore routing | Yes |
 
-**Naming Note:** Command 14 is called `PHONECALL_Incoming` in the firmware D-Bus signals (`kRiddleAudioSignal_PHONECALL_Incoming`); `INCOMING_CALL_INIT` is the capture-derived name used here. Command 16 (`NAVI_COMPLETE`) is not listed in the simplified `usb_protocol.md` command table but is capture-verified.
+**Naming Note:** Command 14 is called `PHONECALL_Incoming` in the firmware D-Bus signals (`kRiddleAudioSignal_PHONECALL_Incoming`); `INCOMING_CALL_INIT` is the capture-derived name used here.
 
-**IMPORTANT:**
-- No SIRI_STOP (0x0F) command exists - Siri sessions end via OUTPUT_STOP
-- NAVI_STOP (0x08) is **misleading** - it actually activates Siri/voice mode
+**CORRECTIONS (2026-04-11, verified via live wired + wireless CarPlay captures, iPhone 18,4 iOS 23F5043k):**
+- ~~INPUT_STOP (byte 4) does NOT exist on the USB wire~~ — firmware internal enum only. Both carlink_native and carlink_macOS assign PHONECALL_START=4 and work correctly. The entire table is shifted by -1 from byte 4 onward vs the previous version.
+- **SIRI_STOP (byte 9) EXISTS on wire** — previously documented as nonexistent. Captured on both wired (22:56:33.219) and wireless (01:38:25.285) CarPlay sessions. Siri end sequence: CMD 2 (StopRecordMic) → SIRI_STOP → OUTPUT_STOP.
+- **TBT_START (byte 15) EXISTS on wire** — previously undocumented. Captured on wireless CarPlay (01:40:35.441). Precedes NAVI_START in turn-by-turn navigation sequences.
+- **NAVI_START first prompt uses dt=2** (not dt=4) — subsequent prompts in the same sequence use dt=4. Confirmed on both wired and wireless.
+- **PHONECALL_STOP can fire 2-3 times** on incoming call hangup (168-178ms apart). Wireless sessions show more aggressive post-hangup cycling than wired. Apps must handle idempotent stops.
+- **Volume restore packets (vol=1.00 dur=0.5)** sent after nav prompts on wireless CarPlay — not observed on wired. Explicit unduck signal.
 
 ---
 
@@ -210,11 +215,31 @@ OUTPUT_STOP (dt=4, at=1)
 ```
 
 ### Navigation Prompt
+*Verified: wired + wireless CarPlay captures (2026-04-10/11, iPhone 18,4)*
 ```
-PHONECALL_STOP (dt=2, at=2)      ← Channel clear
+CMD 506 (RequestNaviFocus)       ← Precedes audio
+NAVI_START (dt=2, at=2)          ← First prompt uses dt=2 (not dt=4!)
 OUTPUT_START (dt=4, at=2)
-NAVI_START (dt=4, at=2)
-  ↓ [nav audio ~1.5-2 seconds]
+  ↓ [nav audio ~1.5-3 seconds]
+VOL packet (vol=1.00, dur=0.5)   ← Explicit unduck (wireless only)
+NAVI_STOP (dt=4, at=2)
+  ↓ [optional: additional prompts as NAVI_START dt=4 at=2]
+NAVI_COMPLETE (dt=4, at=2)
+OUTPUT_STOP (dt=4, at=2)
+CMD 19 (StopGNSSReport)          ← Brackets nav audio
+CMD 507 (ReleaseNaviFocus)
+CMD 18 (StartGNSSReport)         ← Restarts GPS
+```
+
+### Turn-by-Turn + Navigation
+*Verified: wireless CarPlay capture (2026-04-11)*
+```
+TBT_START (dt=4, at=2)          ← Turn-by-turn pre-announcement (byte 15)
+OUTPUT_START (dt=4, at=2)
+NAVI_START (dt=4, at=2)          ← Voice prompt follows TBT
+  ↓ [nav audio]
+VOL packet (vol=1.00, dur=0.5)   ← Unduck
+NAVI_STOP (dt=4, at=2)
 NAVI_COMPLETE (dt=4, at=2)
 OUTPUT_STOP (dt=4, at=2)
 ```
@@ -225,96 +250,91 @@ MEDIA_START (dt=4, at=1)         ← Media begins
 OUTPUT_START (dt=4, at=1)
   ↓ [media plays on audio_type=1]
 
-VOL packet (vol=0.20)            ← Adapter ducks media
-PHONECALL_STOP (dt=2, at=2)      ← Nav prompt incoming
+CMD 506 (RequestNaviFocus)
+NAVI_START (dt=2, at=2)          ← First nav prompt (dt=2!)
 OUTPUT_START (dt=4, at=2)
-NAVI_START (dt=4, at=2)
   ↓ [nav on at=2, media ducks on at=1]
+VOL packet (vol=1.00, dur=0.5)   ← Unduck (wireless)
+NAVI_STOP (dt=4, at=2)
 NAVI_COMPLETE (dt=4, at=2)
 OUTPUT_STOP (dt=4, at=2)
-VOL packet (vol=1.00)            ← Adapter restores media
+CMD 507 (ReleaseNaviFocus)
   ↓ [media resumes full volume]
 ```
 
 ### Siri Invocation
+*Verified: wired + wireless CarPlay captures (2026-04-10/11)*
 ```
-NAVI_STOP (dt=5, at=1)           ← Activates Siri mode
-INPUT_START (dt=5, at=1)         ← Microphone on
-OUTPUT_START (dt=5, at=1)        ← Audio output on
-  ↓ [mic data OUT: dt=5, at=3, ~4 packets/sec]
-  ↓ [Siri audio IN: dt=5, at=1, 972-byte packets]
-SIRI_START (dt=5, at=1)          ← Siri responding
+SIRI_START (dt=5, at=1)          ← Siri activated
+MEDIA_STOP (dt=4, at=1)          ← Music stops
+OUTPUT_STOP (dt=4, at=1)
+INPUT_CONFIG (dt=5, at=1)        ← Mic config (16kHz)
+CMD 1 (StartRecordMic)           ← Mic on
+OUTPUT_START (dt=5, at=1)        ← Siri audio output begins
+  ↓ [Siri speech IN: dt=5, at=1, 972-byte packets]
+  ↓ [silence (all zeros): Siri listening for user input]
+MEDIA_STOP (dt=4, at=1)          ← Redundant (already stopped)
+CMD 2 (StopRecordMic)            ← Mic off
+SIRI_STOP (dt=5, at=1)           ← Siri session ended
 OUTPUT_STOP (dt=5, at=1)
+  ↓ [optional: brief SIRI_START→SIRI_STOP re-trigger within ~62ms]
+MEDIA_START (dt=4, at=1)         ← Music resumes
+OUTPUT_START (dt=4, at=1)
 ```
+**CRITICAL:** PHONECALL_START arrives ~130ms BEFORE SIRI_STOP when making calls via Siri. Do NOT kill mic on SIRI_STOP if a phone call is active.
 
 ### Incoming Phone Call
+*Verified: wired + wireless CarPlay captures (2026-04-10/11, iPhone 18,4)*
 
-The same commands are used across captures, but the **ordering varies** between sessions. The adapter does not guarantee a fixed command sequence — the app must handle commands in any order.
+The same commands are used across captures, but the **ordering varies** between sessions. The adapter does not guarantee a fixed command sequence — the app must be state-driven, not sequence-driven.
 
-**Sequence A (Pi-Carplay Capture, Jan 2026):**
+**Canonical Sequence (Live Capture, 2026-04-10/11, verified wired + wireless):**
 ```
 INCOMING_CALL_INIT (dt=5, at=1)  ← Call notification
-  ↓ ~300ms
+MEDIA_STOP (dt=4, at=1)          ← Music stops
+OUTPUT_STOP (dt=4, at=1)
 ALERT_START (dt=4, at=1)         ← Ringtone begins
 OUTPUT_START (dt=4, at=1)
-  ↓ [ringtone audio: dt=4, at=1, rings 7-13s]
-ALERT_STOP (dt=4, at=1)
+  ↓ [ringtone audio: dt=4, at=1, rings ~6s]
+ALERT_STOP (dt=4, at=1)          ← Ringtone ends (user answered)
 OUTPUT_STOP (dt=4, at=1)
-  ↓ ~150ms
-INPUT_START (dt=5, at=1)         ← Mic activates
-INPUT_STOP (dt=5, at=1)          ← State transition
-OUTPUT_START (dt=5, at=1)        ← Call audio begins
+INPUT_CONFIG (dt=5, at=1)        ← Mic config (16kHz)
+CMD 1 (StartRecordMic)           ← Mic on
 PHONECALL_START (dt=5, at=1)     ← Call connected
-  ↓ [call in progress]
-OUTPUT_STOP (dt=5, at=1)         ← Call ends
+OUTPUT_START (dt=5, at=1)        ← Voice audio begins
+  ↓ [call audio IN: dt=5, at=1, 972-byte packets]
+  ↓ [mic data OUT: dt=5, at=3]
+CMD 2 (StopRecordMic)            ← Mic off
+PHONECALL_STOP (dt=5, at=1)      ← Call ends
+OUTPUT_STOP (dt=5, at=1)
+PHONECALL_STOP (dt=5, at=1)      ← Duplicate (168-178ms later, normal)
+MEDIA_START (dt=4, at=1)         ← Music resumes
+OUTPUT_START (dt=4, at=1)
 ```
 
-**Sequence B (Live App Capture, Feb 2026):**
-```
-INCOMING_CALL_INIT (dt=5, at=1)  ← Call notification
-OUTPUT_START (dt=4, at=1)        ← Ringtone begins (no ALERT_START)
-  ↓ [ringtone audio: dt=4, at=1, rings ~6.7s]
-INPUT_CONFIG (dt=5, at=1)        ← Mic config (INPUT_START)
-PHONECALL_START (dt=5, at=1)     ← Call connected (no INPUT_START→INPUT_STOP transition)
-  ↓ [call in progress ~37s]
-  ↓ [OUTPUT_START/OUTPUT_STOP cycling every 3-10s]
-PHONECALL_STOP (dt=2, at=2)     ← Call ends
-PHONECALL_STOP (dt=2, at=2)     ← Duplicate, 199ms later
-```
-
-**Observed ordering differences:**
-
-| Phase | Sequence A | Sequence B |
-|-------|-----------|-----------|
-| Ring | ALERT_START → ring → ALERT_STOP | OUTPUT_START only |
-| Ring→call | INPUT_START → INPUT_STOP → OUTPUT_START | INPUT_CONFIG → PHONECALL_START |
-| During call | Stable | OUTPUT_START/STOP cycling every 3-10s |
-| Call end | Single OUTPUT_STOP | Duplicate PHONECALL_STOP (199ms apart) |
-
-The ordering likely varies based on firmware version, whether media was already playing, and host ack timing. Both use the same commands — the app must be state-driven, not sequence-driven.
+**Wireless post-hangup rapid cycle (2026-04-11):** After incoming call hangup on wireless, the adapter may briefly re-establish then immediately drop: PHONECALL_STOP → INPUT_CONFIG → CMD 1 → PHONECALL_START → OUTPUT_START → CMD 2 → PHONECALL_STOP → PHONECALL_STOP (all within ~200ms). Apps must handle this idempotently.
 
 **OUTPUT_START/STOP Cycling:** During active phone calls, the adapter may send OUTPUT_START/OUTPUT_STOP pairs every 3-10 seconds. This is internal buffer management and does not indicate call audio interruption. The app should not tear down AudioTracks on these signals during an active call.
 
-**Mic Performance (Live Capture):**
-- Chunk sizes observed: 640 bytes (20ms, live) and 8204 bytes (Pi-Carplay) — both valid
-- Duration: 36,909ms | Total: 1,179,520 bytes | Overruns: 0
-
-**Call Audio Playback (Live Capture):**
-- 6 underruns + 107 zero-fills during 37s call
-- Format switch 48kHz→16kHz pool creation adds ~90ms latency at call start
-
 ### Outgoing Phone Call
+*Verified: wired + wireless CarPlay captures (2026-04-10/11)*
 ```
-INPUT_STOP (dt=5, at=1)          ← Clear mic state
-INPUT_START (dt=5, at=1)         ← Mic activates
-OUTPUT_START (dt=5, at=1)        ← Audio output begins
 PHONECALL_START (dt=5, at=1)     ← Call connected
+MEDIA_STOP (dt=4, at=1)          ← Music stops
+OUTPUT_STOP (dt=4, at=1)
+INPUT_CONFIG (dt=5, at=1)        ← Mic config (16kHz)
+CMD 1 (StartRecordMic)           ← Mic on
+OUTPUT_START (dt=5, at=1)        ← Voice audio begins
   ↓ [call audio IN: dt=5, at=1]
   ↓ [mic data OUT: dt=5, at=3]
-OUTPUT_STOP (dt=5, at=1)         ← Call ends
+CMD 2 (StopRecordMic)            ← Mic off
+PHONECALL_STOP (dt=5, at=1)      ← Call ends
+OUTPUT_STOP (dt=5, at=1)
+MEDIA_START (dt=4, at=1)         ← Music resumes
+OUTPUT_START (dt=4, at=1)
 ```
 
-**Key differences:** No INCOMING_CALL_INIT, no ALERT_START/STOP (ringback tone in audio stream)
+**Key differences from incoming:** No INCOMING_CALL_INIT, no ALERT_START/STOP (ringback tone is in audio stream, not alerted)
 
 ### iMessage Notification
 ```

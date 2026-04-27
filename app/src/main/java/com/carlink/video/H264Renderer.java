@@ -1,18 +1,5 @@
 package com.carlink.video;
 
-/**
- * Hardware-accelerated H.264 decoder using MediaCodec SYNC mode.
- *
- * Decodes video from CPC200-CCPA adapter and renders to SurfaceView.
- * CarPlay/Android Auto streams are live UI — prioritize immediacy over fidelity.
- *
- * Sync codec approach matches the proven Autokit AvcDecoder pattern:
- * - Bare MediaFormat (no KEY_LOW_LATENCY, KEY_PRIORITY, KEY_MAX_INPUT_SIZE, csd-0/csd-1)
- * - All frames fed with flags=0 (no BUFFER_FLAG_CODEC_CONFIG)
- * - PTS from elapsed time: (uptimeMillis - startDecodeTime) * 1000 microseconds
- * - Separate render thread started on first queued frame
- * - No frame dropping — render all decoded frames immediately
- */
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.os.Process;
@@ -32,6 +19,19 @@ import com.carlink.util.AppExecutors;
 import com.carlink.util.LogCallback;
 
 
+/**
+ * Hardware-accelerated H.264 decoder using MediaCodec SYNC mode.
+ *
+ * Decodes video from the CPC200-CCPA adapter and renders to a {@link Surface}.
+ * CarPlay/Android Auto streams are live UI — prioritize immediacy over fidelity.
+ *
+ * Sync codec approach matches the proven Autokit AvcDecoder pattern:
+ * - Bare MediaFormat (no KEY_LOW_LATENCY, KEY_PRIORITY, KEY_MAX_INPUT_SIZE, csd-0/csd-1)
+ * - All frames fed with flags=0 (no BUFFER_FLAG_CODEC_CONFIG)
+ * - PTS from elapsed time: (uptimeMillis - startDecodeTime) * 1000 microseconds
+ * - Separate render thread started on first queued frame
+ * - No frame dropping — render all decoded frames immediately
+ */
 public class H264Renderer {
 
     /** Callback to request keyframe (IDR) from adapter after codec reset. */
@@ -105,8 +105,9 @@ public class H264Renderer {
     private static final long PERF_LOG_INTERVAL_MS = 30000;
     private long lastPerfLogTime = 0;
 
-    // Pipeline diagnostic counters (debug builds only)
-    // These help identify WHERE the pipeline breaks when video freezes
+    // Pipeline diagnostic counters — always updated; only the periodic logStats()
+    // emission is gated (via the VIDEO_PERF tag in logPerf). They identify
+    // WHERE the pipeline breaks when video freezes.
     private final AtomicLong framesReceived = new AtomicLong(0);
     private final AtomicLong feedSuccesses = new AtomicLong(0);
     private volatile long lastFeedTime = 0;
@@ -165,7 +166,9 @@ public class H264Renderer {
     private final Object codecLock = new Object();
 
     // FIFO staging queue (SPSC ring): USB thread writes, feeder thread reads.
-    // 4-slot power-of-2 ring (3 usable) absorbs USB frame bursts without overwrites.
+    // 4-slot power-of-2 ring (3 usable) absorbs short USB frame bursts. On sustained
+    // overflow, the incoming frame is dropped (queued frames preserved) and a
+    // reactive keyframe request is fired so we don't render corrupted P-frames.
     // 6 buffers: 1 write + up to 3 in queue + 1 feeder + 1 pool margin.
     private static final int STAGED_FRAME_CAPACITY = 512 * 1024;  // 512KB, covers 1080p I-frames
     private static final int STAGED_FRAME_COUNT = 6;               // write + queue(3) + feed + margin
@@ -181,7 +184,9 @@ public class H264Renderer {
     private final AtomicLong stagingDropCount = new AtomicLong(0);
     private final AtomicLong oversizedDropCount = new AtomicLong(0);
 
-    // Fix A: Reactive keyframe request after staging drops
+    // Reactive keyframe request after a staging drop: signal the feeder thread to
+    // ask the source for an IDR so we don't render corrupted P-frames until the
+    // next natural keyframe. Cooldown bounds how often we re-request.
     private volatile boolean stagingOverwriteDetected = false;
     private volatile long lastReactiveKeyframeTimeNs = 0;
     private static final long REACTIVE_KEYFRAME_COOLDOWN_NS = 500_000_000L;  // 500ms
@@ -210,8 +215,13 @@ public class H264Renderer {
 
     /**
      * Enable Android Auto decoder mode.
-     * Must be called before start() or during codec lifecycle for immediate effect.
-     * Enables: first-frame skip, frame cache replay, crop scaling mode.
+     *
+     * Effects:
+     * - first-frame render skip: takes effect immediately on the running codec.
+     * - frame-cache replay on decoder recreation: takes effect immediately.
+     * - {@code VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING}: only applied inside
+     *   {@link #initCodec}, so toggling AA mode on a live codec will NOT change the
+     *   scaling mode until the next start/reset.
      */
     public void setAndroidAutoMode(boolean enabled) {
         this.androidAutoMode = enabled;
@@ -765,7 +775,8 @@ public class H264Renderer {
                     decodeFrame(frame);
                     framePool.offer(frame);
 
-                    // Fix A: After feeding, check if a staging drop occurred -> request reactive keyframe
+                    // After feeding, if a staging drop occurred, ask the source for an
+                    // IDR (cooldown-bounded) so subsequent P-frames decode cleanly.
                     if (stagingOverwriteDetected) {
                         stagingOverwriteDetected = false;
                         long now = System.nanoTime();
@@ -924,9 +935,10 @@ public class H264Renderer {
 
                 do {
                     if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                        // No output available yet — will block again at top of while loop
+                        // No output yet — fall through to exit do-while; the outer
+                        // loop will re-block on dequeueOutputBuffer with the 100ms timeout.
                     } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
-                        // Deprecated but harmless
+                        // Deprecated since API 21 but still emitted on some devices; ignore.
                     } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         try {
                             MediaFormat format = codec.getOutputFormat();
@@ -977,8 +989,9 @@ public class H264Renderer {
                         continue;  // Process the newly dequeued buffer
                     }
 
-                    // For non-data results (TRY_AGAIN_LATER, FORMAT_CHANGED, etc.), exit inner loop
-                    outputBufferIndex = -1;  // Signal to exit do-while
+                    // Non-data result (TRY_AGAIN_LATER, FORMAT_CHANGED, etc.): exit
+                    // the inner drain loop and re-block on the outer dequeue.
+                    outputBufferIndex = -1;
                 } while (outputBufferIndex >= 0);
             }
         } catch (Exception e) {
@@ -1085,10 +1098,11 @@ public class H264Renderer {
 
     /**
      * Stage H.264 data for codec feeding. GC-immune USB thread fast path.
-     * Called from USB-ReadLoop thread. [FIFO_STAGING] implementation.
+     * Called from the USB read loop.
      *
-     * USB -> System.arraycopy -> SPSC ring offer. No JNI, no codec calls.
-     * Feeder thread handles all codec interaction on its own timeline.
+     * Hot path: {@code System.arraycopy} into a pre-allocated buffer, then SPSC
+     * ring offer. No JNI, no codec calls. The feeder thread handles all codec
+     * interaction on its own timeline.
      *
      * @return true if frame was staged, false if dropped (oversized, no buffer, or queue full)
      */

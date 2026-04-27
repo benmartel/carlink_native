@@ -10,13 +10,35 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * CPC200-CCPA Adapter Protocol Driver
+ * CPC200-CCPA Adapter Protocol Driver.
  *
  * Manages the protocol-level communication with the Carlinkit adapter:
- * - Initialization sequence
- * - Heartbeat keepalive
- * - Message sending and receiving
- * - Performance tracking
+ *  - Initialization sequence (three modes; see [start]).
+ *  - Heartbeat keepalive — 2 Hz, started BEFORE init because the firmware watchdog
+ *    expects heartbeats within ~10 s of USB open or it resets the endpoint (see
+ *    documents/reference/heartbeat_analysis.md).
+ *  - Message sending (fan-out through a single [send] gate) and receiving (USB read
+ *    thread → [messageHandler]).
+ *  - Performance counters for diagnostic [logPerformanceStats] dumps on stop.
+ *
+ * Threading:
+ *  - [send] is called from the heartbeat timer, mic capture timer, main thread, and
+ *    anywhere an IPC needs to go out. Counters are atomic. HOWEVER, [send] does NOT
+ *    serialize concurrent calls: the underlying UsbDeviceConnection.bulkTransfer is
+ *    not documented as thread-safe on a single endpoint. The code survives today
+ *    because the writer threads have widely-spaced natural cadences (heartbeat 2s,
+ *    mic capture buffered, touch events user-driven). Do not add a fourth hot writer
+ *    without introducing a write-side lock.
+ *  - [messageHandler] runs on the USB read thread. Handlers MUST return quickly —
+ *    blocking the read thread stalls all inbound messages AND (indirectly) heartbeats
+ *    that contend for the same USB endpoint.
+ *  - [isRunning] is the single gate: after [stop], every [send] silently returns
+ *    false. Callers that need to distinguish "not running" from "send failed" must
+ *    track state externally.
+ *
+ * External references: "pi-carplay" cited in several comments is an out-of-tree
+ * project whose USB captures are mirrored under documents/reference/ — not a vendored
+ * dependency. Treat it as the empirical source for timing and sequence decisions.
  */
 class AdapterDriver(
     private val usbDevice: UsbDeviceWrapper,
@@ -29,13 +51,20 @@ class AdapterDriver(
 ) {
     private var heartbeatTimer: Timer? = null
     private var wifiConnectTimer: Timer? = null
+    // 2s gives ~5 heartbeats inside the firmware's ~10s watchdog window; the first
+    // heartbeat must arrive within ~10s of USB open, which is why startHeartbeat()
+    // runs BEFORE the init loop. Verified on live CarPlay sessions: the measured
+    // mean interval on the wire stays within 2.00-2.20 s across the full session,
+    // consistent with Timer.scheduleAtFixedRate jitter. See in-tree heartbeat
+    // analysis notes under documents/reference/ for the watchdog derivation.
     private val heartbeatInterval = 2000L // 2 seconds
 
     private val isRunning = AtomicBoolean(false)
 
-    // Performance tracking — atomic because send() is called from multiple
-    // threads (heartbeat timer, mic capture timer, main thread) and the
-    // reading loop callback runs on the USB read thread.
+    // Performance tracking — atomic because send() is called from multiple threads
+    // (heartbeat timer, mic capture timer, main thread) and the reading loop callback
+    // runs on the USB read thread. NOTE: atomics only protect the counters, not the
+    // USB write itself — see class KDoc threading section.
     private val messagesSent = AtomicInteger(0)
     private val messagesReceived = AtomicInteger(0)
     private val bytesSent = AtomicLong(0)
@@ -98,7 +127,8 @@ class AdapterDriver(
         val allSent = initFailures == 0
         log("Initialization sequence completed (${initMessagesCount - initFailures}/$initMessagesCount sent)")
 
-        // Schedule wifiConnect with timeout (matches pi-carplay behavior)
+        // Schedule wifiConnect with timeout (matches pi-carplay behavior; see
+        // documents/reference/ for the capture traces that pin down the 600 ms delay).
         wifiConnectTimer =
             Timer().apply {
                 schedule(
@@ -144,6 +174,10 @@ class AdapterDriver(
 
     /**
      * Send raw data to the adapter.
+     *
+     * Silently returns false when [isRunning] is false (post-[stop]). Callers that
+     * must distinguish "adapter not running" from "USB write failed" need to check
+     * state separately. Not serialized against concurrent calls — see class KDoc.
      *
      * @param data Serialized message data
      * @return true if send was successful
@@ -270,7 +304,7 @@ class AdapterDriver(
      * Send graceful teardown sequence. Must be called BEFORE stop()
      * since send() requires isRunning==true.
      *
-     * Sequence (from pi-carplay USB captures):
+     * Sequence (from pi-carplay USB captures — see documents/reference/):
      * 1. DisconnectPhone (0x0F) — end phone's CarPlay/AA session
      * 2. CloseDongle (0x15) — stop adapter internal processes
      * 3. RebootAdapter (0xCD) — optional full adapter reboot
@@ -351,7 +385,9 @@ class AdapterDriver(
                     val header = MessageHeader(dataLength, MessageType.fromId(type))
                     val message = MessageParser.parseMessage(header, data)
 
-                    // Log received message (except high-frequency types)
+                    // Log received message (except high-frequency types). Suppression
+                    // list is conservative — extend it if a new echo path becomes noisy
+                    // (e.g., adapter starts mirroring GNSS_DATA or position updates).
                     if (type != MessageType.VIDEO_DATA.id && type != MessageType.AUDIO_DATA.id &&
                         type != MessageType.NAVI_VIDEO_DATA.id && type != MessageType.HEARTBEAT_ECHO.id
                     ) {

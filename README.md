@@ -55,7 +55,7 @@ Audio:
 
 
 > [!IMPORTANT]
-> My Primary smartphone is an iPHone and therefor Carplay as gotten the most tuning and testing. A Google Pixel 10 is used for testing basic functionality, cannot do real-world 'Day to Day' testing.
+> My Primary smartphone is an iPhone and therefor Carplay as gotten the most tuning and testing. A Google Pixel 10 is used for testing basic functionality, cannot do real-world 'Day to Day' testing.
 
 ## Screen Shots from Android Emulator with USB-PassThrough for CPC200-CCPA Use
 

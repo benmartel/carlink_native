@@ -7,8 +7,14 @@ import com.carlink.R
  * Maps CPManeuverType (0-53) to VectorDrawable resource IDs for cluster display.
  *
  * Roundabout exit types (28-46) all use the generic enter-roundabout icon because the
- * adapter does not forward exit angle/junction geometry data from iAP2, making per-exit
+ * adapter does not forward exit angle/junction geometry data from iAP2 (see usb_protocol.md
+ * "Fields NOT forwarded: JunctionElementAngle / JunctionElementExitAngle"), making per-exit
  * icons incorrect for roundabouts with varying spoke counts.
+ *
+ * Keep in sync with [ManeuverMapper.mapManeuverType]: both paths read the same cpType and
+ * both feed the same Maneuver object in ManeuverMapper.buildManeuverForType. If one learns
+ * a new code (e.g., protocol extension beyond 53) without the other, the cluster will
+ * render an icon that contradicts the Car-App-Library-driven Maneuver.TYPE_* semantic.
  */
 object ManeuverIconRenderer {
     /** 1:1 mapping: array index == CPManeuverType value. */
@@ -77,7 +83,13 @@ object ManeuverIconRenderer {
         // Roundabout exit types 28-46: use generic roundabout icon.
         // The adapter strips junction geometry (JunctionElementAngle/ExitAngle),
         // so per-exit-number icons show incorrect angular positions.
+        // Redundant with CP_DRAWABLES contents (28-46 already hold the roundabout
+        // entry ID) but kept as a second guard in case the array is ever trimmed.
         if (cpType in 28..46) return CP_DRAWABLES[6] // cp_maneuver_06_enter_roundabout
+        // Fallback for negative / >53 / future-protocol cpType: renders the
+        // straight-ahead arrow (cp_maneuver_00_no_turn). This can visually contradict
+        // a real turn; consider emitting a PROTO_UNKNOWN log if unknown codes need
+        // forensic tracking. No dedicated "unknown maneuver" drawable exists today.
         return CP_DRAWABLES.getOrElse(cpType) { CP_DRAWABLES[0] }
     }
 }
