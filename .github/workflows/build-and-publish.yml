@@ -38,7 +38,7 @@ jobs:
           sed -i -E "s|applicationId = \"[^\"]*\"|applicationId = \"${{ secrets.APP_ID }}\"|g" app/build.gradle.kts
           sed -i -E "s|[a-zA-Z0-9.]+\.ClusterIconContentProvider|${{ secrets.APP_ID }}.ClusterIconContentProvider|g" app/src/main/AndroidManifest.xml
           sed -i -E "s|[a-zA-Z0-9.]+\.ClusterIconContentProvider|${{ secrets.APP_ID }}.ClusterIconContentProvider|g" app/build.gradle.kts
-          sed -i -E 's|name="android.hardware.type.automotive" android:required="true"|name="android.hardware.type.automotive" android:required="false"|g' app/src/main/AndroidManifest.xml
+          sed -i -E '/<uses-feature/{:a;N;/\/>/!ba;/android.hardware.type.automotive/d}' app/src/main/AndroidManifest.xml
           NEW_VERSION_CODE=$((300 + ${{ github.run_number }}))
           sed -i "s|versionCode = [0-9]*|versionCode = ${NEW_VERSION_CODE}|g" app/build.gradle.kts
           echo "Applied applicationId: ${{ secrets.APP_ID }}, versionCode: ${NEW_VERSION_CODE}"
