@@ -15,7 +15,7 @@ android {
 
     defaultConfig {
         applicationId = "zeno.carlink"
-        minSdk = 32
+        minSdk = 29
         targetSdk = 36
         versionCode = 208
         versionName = "1.0.0"
@@ -41,6 +41,41 @@ android {
         }
     }
 
+    // Distribution split:
+    //   sideload → APK only (Play Console rejects apps that claim Templates Host's
+    //              ClusterIconContentProvider authority globally). Shim claims the
+    //              GM authority so Templates Host icon delivery works on-device.
+    //   play     → AAB upload to Play Store. Shim is registered under an
+    //              applicationId-suffixed authority to avoid the Play Console
+    //              "content provider authority in use by other developers" rejection
+    //              (issue #6). Templates Host's calls to the GM authority go nowhere
+    //              on Play installs; NavigationStateManager.initialize() detects this
+    //              at runtime and falls back to type-based maneuver icons.
+    flavorDimensions += "distribution"
+
+    productFlavors {
+        create("sideload") {
+            dimension = "distribution"
+            manifestPlaceholders["clusterIconAuthority"] =
+                "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
+            buildConfigField(
+                "String",
+                "CLUSTER_ICON_AUTHORITY",
+                "\"com.google.android.apps.automotive.templates.host.ClusterIconContentProvider\""
+            )
+        }
+        create("play") {
+            dimension = "distribution"
+            manifestPlaceholders["clusterIconAuthority"] =
+                "zeno.carlink.ClusterIconContentProvider"
+            buildConfigField(
+                "String",
+                "CLUSTER_ICON_AUTHORITY",
+                "\"zeno.carlink.ClusterIconContentProvider\""
+            )
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -48,12 +83,19 @@ android {
 
     buildFeatures {
         compose = true
-        buildConfig = true // Enable BuildConfig generation for debug checks
+        buildConfig = true  // Enable BuildConfig generation for debug checks
+        aidl = true         // INaviVideoSink / INaviVideoSource for ClusterHomeDisplay AltVideo (0x2C)
     }
 
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
         }
     }
 
@@ -65,6 +107,16 @@ android {
         disable += "DiscouragedApi"
         disable += "Instantiatable" // CarAppActivity from app-automotive AAR — false positive
         disable += "InvalidUsesTagAttribute" // "navigation" is valid for Car App Library nav apps
+    }
+}
+
+// Drop playDebug — Play Console rejects debuggable bundles, and there is no
+// reason to build/install/run a debug variant tied to the play flavor. Result:
+// Build Variants panel and the Generate Signed Bundle / APK wizard show only
+// sideloadDebug, sideloadRelease, playRelease.
+androidComponents {
+    beforeVariants(selector().withName("playDebug")) { variant ->
+        variant.enable = false
     }
 }
 
@@ -123,8 +175,9 @@ dependencies {
     // media3-common provides Player / SimpleBasePlayer / MediaItem / MediaMetadata.
     // media3-exoplayer is intentionally NOT included: this app does not decode/play audio
     // locally — the connected phone plays over USB; we only mirror metadata + forward commands.
-    implementation("androidx.media3:media3-session:1.10.0")
-    implementation("androidx.media3:media3-common:1.10.0")
+    val media3Version = "1.10.0"
+    implementation("androidx.media3:media3-session:$media3Version")
+    implementation("androidx.media3:media3-common:$media3Version")
 
     // Car App Library for AAOS cluster navigation (Templates Host)
     implementation("androidx.car.app:app:1.7.0")
@@ -132,6 +185,9 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test:core:1.7.0")
+    testImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
     androidTestImplementation(platform("androidx.compose:compose-bom:2026.03.00"))

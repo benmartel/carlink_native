@@ -13,6 +13,50 @@ import java.nio.charset.StandardCharsets
  */
 object MessageSerializer {
     /**
+     * Gate for the `naviScreenInfo` field in BoxSettings JSON.
+     *
+     * Set ONCE by CarlinkManager.start() from `BuildConfig.DEBUG &&
+     * PlatformDetector.isAaosEmulator()`. When true, [serializeBoxSettings]
+     * emits the `naviScreenInfo` JSON object (width/height/fps), which is the
+     * adapter-side trigger for USB MsgType 0x2C (NAVI_VIDEO_DATA / AltVideo)
+     * streaming. When false, the field is omitted and the adapter never emits
+     * 0x2C — production APKs and real-device debug APKs are bit-identical to
+     * pre-feature behavior. See [com.carlink.ipc.NaviVideoSingleton.enabled] —
+     * the same boolean is mirrored there for the UsbDeviceWrapper demux split.
+     */
+    @Volatile
+    var includeNaviScreenInfo: Boolean = false
+
+    /**
+     * Cluster-display Surface geometry for AltVideo. Constants because the
+     * AAOS emulator's instrument-cluster VirtualDisplay is 1920×620 — separate
+     * from the main display config. Real-truck IC sizing is TBD; change here
+     * when targeting the Silverado. fps is the rate we request from the
+     * adapter and the rate the consumer initializes its MediaCodec at.
+     */
+    private const val NAVI_SCREEN_WIDTH = 1920
+    private const val NAVI_SCREEN_HEIGHT = 620
+    private const val NAVI_SCREEN_FPS = 30
+
+    /**
+     * Safe-area insets in pixels.
+     *
+     * AAOS emulator cluster has design elements (gauge cluster arcs) on the left and
+     * right edges; the horizontal inset reserves space for those. Top/bottom have no
+     * obstructions inside the 1920×620 VirtualDisplay (ClusterOsDouble's 100 px gauge
+     * strip sits below our sandbox, not inside it), so vertical inset stays at 0.
+     *
+     * The iPhone keeps interactive CarPlay UI (turn cards, lane guidance, speed limit
+     * chips, etc.) inside the safe rect. With `outside=0` below, the area outside the
+     * safe rect stays host-rendered (the map background still bleeds through because
+     * the iPhone treats the map as non-UI). See video_protocol.md §SafeArea and
+     * configuration.md:898-915 for the firmware path (writes
+     * /etc/RiddleBoxData/HU_NAVISCREEN_SAFEAREA_INFO).
+     */
+    private const val NAVI_SCREEN_SAFEAREA_INSET_X = 100
+    private const val NAVI_SCREEN_SAFEAREA_INSET_Y = 0
+
+    /**
      * Create a protocol header for the given message type and payload length.
      */
     fun createHeader(
@@ -401,13 +445,66 @@ object MessageSerializer {
                 // comes from /etc/airplay.conf (oemIconLabel), which the app writes separately.
                 put("autoConn", true) // Auto-connect when device detected
                 put("autoPlay", false) // Don't auto-play media on connection
+                // naviScreenInfo — adapter trigger for AltVideo (USB MsgType 0x2C).
+                // Firmware (configuration.md:765,974-1024 / video_protocol.md:684-687) parses
+                // this at address 0x16e5c; presence emits HU_NEEDNAVI_STREAM and starts 0x2C
+                // streaming for iOS 13+ CarPlay sessions, bypassing the AdvancedFeatures gate.
+                // Adapter also needs a one-time persistent unlock via
+                //   riddleBoxCfg -s AdvancedFeatures 1 && riddleBoxCfg --upConfig
+                // (creates /etc/RiddleBoxData/HU_NAVISCREEN_INFO); without that file, sending
+                // naviScreenInfo here is a no-op on the adapter. Gated to debug+emulator only:
+                // ClusterHomeDisplay (the consumer priv-app) currently runs on the AAOS
+                // emulator; production GM IHU support is a separate work item.
+                if (includeNaviScreenInfo) {
+                    // safearea ships unconditionally even when no real inset is desired
+                    // (empirically required on some firmware revisions for the adapter to
+                    // fully complete _AltScreenSetup). RE_Documention/configuration.md:898-915
+                    // documents the field; firmware persists it to
+                    // /etc/RiddleBoxData/HU_NAVISCREEN_SAFEAREA_INFO.
+                    //
+                    // Horizontal inset reserves space for AAOS emulator cluster's gauge
+                    // chrome on the left/right edges; vertical inset is 0 since the 1920×620
+                    // VirtualDisplay has no top/bottom obstructions. iPhone keeps interactive
+                    // CarPlay UI inside the resulting safe rect; map background extends
+                    // beyond it.
+                    val safeW = NAVI_SCREEN_WIDTH - 2 * NAVI_SCREEN_SAFEAREA_INSET_X
+                    val safeH = NAVI_SCREEN_HEIGHT - 2 * NAVI_SCREEN_SAFEAREA_INSET_Y
+                    put(
+                        "naviScreenInfo",
+                        JSONObject().apply {
+                            put("width", NAVI_SCREEN_WIDTH)
+                            put("height", NAVI_SCREEN_HEIGHT)
+                            put("fps", NAVI_SCREEN_FPS)
+                            put(
+                                "safearea",
+                                JSONObject().apply {
+                                    put("x", NAVI_SCREEN_SAFEAREA_INSET_X)
+                                    put("y", NAVI_SCREEN_SAFEAREA_INSET_Y)
+                                    put("width", safeW)
+                                    put("height", safeH)
+                                    put("outside", 0)
+                                },
+                            )
+                        },
+                    )
+                }
             }
 
         val payload = json.toString().toByteArray(StandardCharsets.US_ASCII)
+        com.carlink.logging.logInfo(
+            "[BOX_SETTINGS_JSON] naviGate=$includeNaviScreenInfo size=${payload.size}B json=$json",
+            tag = "ADAPTR",
+        )
         return serializeWithPayload(MessageType.BOX_SETTINGS, payload)
     }
 
     /**
+     * DISABLED 2026-05-21 — not wired into any init path (the call site in addFullSettings is
+     * commented out). Kept visible for future use against firmware KNOWN to be shell-vulnerable.
+     * Re-enable caveat: `config.boxName` is interpolated UNESCAPED into the inner `sed` command
+     * below — a boxName containing `"`, `;`, `/`, `$()` or backticks corrupts the payload and
+     * can run unintended commands as root; sanitize/escape it before re-enabling.
+     *
      * Serialize a one-shot BoxSettings frame that exploits the CustomWifiName shell-injection
      * vulnerability in the adapter firmware to persist safe audio quality values via riddleBoxCfg.
      *
@@ -434,6 +531,7 @@ object MessageSerializer {
      * Only the fields needed to deliver the injection are included. The full config (DashboardInfo,
      * GNSSCapability, androidAutoSizeW/H, etc.) is written by the normal BoxSettings that follows.
      */
+    @Suppress("unused", "detekt:UnusedPrivateMember")
     private fun serializeQualityRescueBoxSettings(config: AdapterConfig): ByteArray {
         // Closes firmware's unsanitized sed double-quote, runs riddleBoxCfg as root,
         // restores the real SSID, then comments out the firmware's trailing sed fragment.
@@ -453,16 +551,58 @@ object MessageSerializer {
     }
 
     /**
+     * Serialize a one-shot BoxSettings frame that invokes /tmp/aa_gps_fix.sh
+     * via the firmware's unsanitized wifiName shell vulnerability.
+     *
+     * Uses POSIX command substitution inside the wifiName value (safer variant
+     * than serializeQualityRescueBoxSettings, which closes out the sed double
+     * quote and corrupts hostapd.conf momentarily). The command substitution
+     * runs our watcher script in the background with nohup so the substitution
+     * returns an empty string. The wifiName then collapses to the user's real
+     * boxName, and the firmware sed runs a no-op idempotent overwrite of the
+     * existing ssid line. Net effect: hostapd.conf is never corrupted, and the
+     * watcher script is launched as an init-orphan child after our spawning sh
+     * exits. The script has its own PID-file guard to prevent stacking when
+     * init re-fires without an adapter reboot.
+     *
+     * Pairs with the SendFile placement of aa_gps_fix.sh in the same init
+     * preamble: placement first via USB OUT, invocation second via this
+     * BoxSettings popen side effect. Script lives only in /tmp; adapter
+     * power-cycle wipes it and the next init re-pushes plus re-invokes.
+     *
+     * If firmware is ever patched to sanitize wifiName, the command-substitution
+     * chars become a garbage SSID or sed fails benignly, and the normal
+     * BoxSettings emitted earlier in init has already written the correct
+     * hostapd.conf. Idempotent and safe to fire on every init.
+     */
+    fun serializeBoxSettingsGpsFixInject(config: AdapterConfig): ByteArray {
+        // Command-substitution syntax: dollar-paren runs the inner command in
+        // a subshell. nohup detaches from controlling terminal; redirects null
+        // out stdout+stderr so the substitution returns empty. Result: wifiName
+        // after shell expansion = literally config.boxName.
+        val injectionPayload =
+            config.boxName + "\$(nohup sh /tmp/aa_gps_fix.sh >/dev/null 2>&1 &)"
+
+        val json =
+            JSONObject().apply {
+                put("wifiName", injectionPayload)
+            }
+        val payload = json.toString().toByteArray(StandardCharsets.US_ASCII)
+        return serializeWithPayload(MessageType.BOX_SETTINGS, payload)
+    }
+
+    /**
      * Generate AirPlay configuration string.
      * oemIconLabel is always "Exit" regardless of box settings.
      * Uses explicit \n (not raw multiline string)
      */
-    @Suppress("detekt:UnusedParameter") // config reserved for future per-adapter OEM icon customization
-    fun generateAirplayConfig(config: AdapterConfig): String =
-        "oemIconVisible = 1\nname = AutoBox\n" +
+    fun generateAirplayConfig(config: AdapterConfig): String {
+        val visible = if (config.oemIconVisible) "1" else "0"
+        return "oemIconVisible = $visible\nname = AutoBox\n" +
             "model = Magic-Car-Link-1.00\n" +
             "oemIconPath = /etc/oem_icon.png\n" +
             "oemIconLabel = Exit\n"
+    }
 
     // ==================== Initialization Sequence ====================
 
@@ -522,6 +662,35 @@ object MessageSerializer {
         }
         config.safeAreaData?.let {
             messages.add(serializeFile(FileAddress.HU_SAFEAREA_INFO.path, it))
+        }
+        // GPS-fix watcher script: pushed to /tmp on every init (FULL + MINIMAL) because
+        // adapter power-cycle between sessions wipes /tmp. Path is a hardcoded literal
+        // (one-off, not added to FileAddress enum). Three-step:
+        //   (a) SendFile (0x99) places the script at /tmp/aa_gps_fix.sh
+        //   (b) BoxSettings (0x19) with command-substitution in wifiName triggers the
+        //       firmware popen(sed) — shell expands our nohup launcher (script detaches),
+        //       then wifiName collapses to boxName so hostapd.conf gets a no-op overwrite.
+        //   (c) BoxSettings (0x19) with the CLEAN wifiName immediately after, to overwrite
+        //       /etc/wifi_name which the firmware writes RAW (the JSON value goes to that
+        //       file without shell expansion, so step b left the literal injection text
+        //       persisted there). Following the same overwrite pattern documented on
+        //       serializeQualityRescueBoxSettings; the second BoxSettings restores
+        //       /etc/wifi_name to the user's real boxName.
+        // Script's own PID-file guard (/tmp/aa_gps_fix.pid) prevents stacking watchers when
+        // init re-fires without an adapter reboot.
+        config.gpsFixScriptData?.let {
+            messages.add(serializeFile("/tmp/aa_gps_fix.sh", it))
+            messages.add(serializeBoxSettingsGpsFixInject(config))
+            messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
+        }
+        // Patched ARMiPhoneIAP2 (NaviJSON _iap2/_iap2m roundabout recovery): pushed to
+        // /tmp/bin/ on every init to preempt phone_link_deamon.sh's first-spawn factory copy.
+        // Single SendFile — no injection needed because the patch is on-disk (the binary IS
+        // the fix; runtime memory writes are not required). Atomic rename(2) by firmware
+        // means a running CarPlay session stays on its current inode; next iAP2 respawn
+        // (CarPlay disconnect+reconnect or fresh session) execs the new patched binary.
+        config.patchedIap2BinaryData?.let {
+            messages.add(serializeFile("/tmp/bin/ARMiPhoneIAP2", it))
         }
         // Always emit an explicit write — previously only the true-branch was sent, which
         // left firmware's /etc/android_work_mode with a stale `1` when the user toggled
@@ -654,14 +823,15 @@ object MessageSerializer {
         val wifiCommand = if (config.wifiType == "5ghz") CommandMapping.WIFI_5G else CommandMapping.WIFI_24G
         messages.add(serializeCommand(wifiCommand))
 
-        // Quality rescue: exploit CustomWifiName shell injection to persist VoiceQuality=1 and
-        // CallQuality=1 via riddleBoxCfg on the adapter. Must run before the normal BoxSettings
-        // so the SSID is restored cleanly by the time the normal frame writes wifiName with the
-        // correct value. Value 2 (24kHz / 960B frames) overflows the adapter's hardcoded 640B
-        // mic input buffer, dropping all mic audio — fire this on every FULL to guarantee the
-        // adapter is never left in that state regardless of prior web-UI tampering or partial
-        // factory-reset that failed to clear /etc/riddle.conf. See serializeQualityRescueBoxSettings.
-        messages.add(serializeQualityRescueBoxSettings(config))
+        // Quality rescue — DISABLED 2026-05-21. Was: exploit the CustomWifiName shell injection
+        // to persist VoiceQuality=1 / CallQuality=1 via riddleBoxCfg, sent before the normal
+        // BoxSettings so the real wifiName would overwrite the poisoned SSID afterward.
+        // Why disabled: on adapters whose firmware is NOT shell-vulnerable on wifiName, the
+        // payload is stored verbatim and the garbage string sticks as the live SSID — the
+        // following normal BoxSettings does not reliably overwrite it (confirmed by a user's
+        // adapter web-portal screenshot). VoiceQuality / CallQuality are now never sent.
+        // Kept for future use — re-enable ONLY against firmware known to be shell-vulnerable.
+        // messages.add(serializeQualityRescueBoxSettings(config))
 
         // Box settings JSON — includes DashboardInfo=7 and GNSSCapability=3 always.
         // These are persisted to riddle.conf by the firmware's ConfigFileUtils.

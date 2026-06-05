@@ -44,10 +44,12 @@ import com.carlink.logging.LogPreset
 import com.carlink.logging.Logger
 import com.carlink.logging.LoggingPreferences
 import com.carlink.logging.apply
+import com.carlink.logging.logWarn
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.media.MediaSessionManager
 import com.carlink.util.LogCallback
+import com.carlink.util.WindowMetricsCompat
 import com.carlink.navigation.NavigationStateManager
 import com.carlink.protocol.AdapterConfig
 import com.carlink.protocol.KnownDevices
@@ -96,20 +98,18 @@ class MainActivity : ComponentActivity() {
     private var fileLogManager: FileLogManager? = null
 
     /**
-     * App-scope MediaSession. Created lazily on the first tier-2 rebuild that selects
-     * ADAPTER audio mode, reused across every subsequent rebuild, and released exactly
-     * once from [onDestroy].
+     * App-scope MediaSession reference. Owned and lifecycle-managed by
+     * [CarlinkMediaBrowserService] — this Activity only reads the live singleton via
+     * [MediaSessionManager.instance] / [MediaSessionManager.getOrCreate] to pass into
+     * [CarlinkManager]. Never released from here; the MBS releases on its own
+     * `onDestroy`. Survival across tier-2 CarlinkManager rebuilds is now a property of
+     * the Service lifecycle (Service stays alive across Activity destruction), not a
+     * property of this field.
      *
-     * Ownership lives HERE — not inside [CarlinkManager] — specifically so the underlying
-     * Media3 [androidx.media3.session.MediaLibrarySession] and its platform session token
-     * survive tier-2 CarlinkManager rebuilds (Apply in AdapterConfigurationDialog /
-     * display-mode changes). A new session token on each rebuild causes AOSP CarLauncher's
-     * MediaControllerCompat to receive `onSessionDestroyed` without rebinding, which
-     * blanks the homescreen Media card until a full package uninstall+reinstall. See
-     * [MediaSessionManager] KDoc "KNOWN OS DEFICIENCY" and the 2026-04-23 diagnostics
-     * snapshot diff in `/Users/zeno/Downloads/carlink_diagnostics/` for the full analysis.
-     *
-     * Writes happen on the main thread inside [initializeCarlinkManager] and [onDestroy].
+     * Boot-race fix (2026-05-03): previously this Activity created the manager, which
+     * meant the session didn't exist until the user tapped the launcher icon — AAOS
+     * auto-launches the MBS at boot and probes onGetSession within ~50ms, so the
+     * Activity-scoped initialize never won the race. Ownership moved to MBS.onCreate.
      */
     private var mediaSessionManager: MediaSessionManager? = null
 
@@ -337,16 +337,11 @@ class MainActivity : ComponentActivity() {
         // Unregister USB detachment receiver
         unregisterUsbDetachReceiver()
 
-        // Release resources (null-safe in case Activity destroyed before init completed).
-        //
-        // Order: CarlinkManager first (it detaches its transport callback from the
-        // MediaSession but does NOT release it — see CarlinkManager.release KDoc),
-        // THEN the app-scope MediaSessionManager. This is the one and only correct
-        // place to release the MediaSession: at full Activity teardown. Releasing it
-        // earlier (e.g. on a tier-2 rebuild) triggers the blank-homescreen-card bug
-        // documented in MediaSessionManager "KNOWN OS DEFICIENCY".
+        // Release the CarlinkManager (it detaches its transport callback from the
+        // MediaSession but does NOT release it — see CarlinkManager.release KDoc).
+        // The MediaSession itself is owned by CarlinkMediaBrowserService; it releases
+        // on its own onDestroy. Just drop the local reference here.
         carlinkManager?.release()
-        mediaSessionManager?.release()
         mediaSessionManager = null
         fileLogManager?.release()
 
@@ -396,23 +391,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun initializeCarlinkManager() {
-        // Get window metrics to determine USABLE area (excluding system UI)
-        // Using WindowMetrics API (minSdk 32 guarantees API 30+ availability)
-        val windowMetrics = windowManager.currentWindowMetrics
-        val bounds = windowMetrics.bounds
-        val windowInsets = windowMetrics.windowInsets
+        // Get window metrics to determine USABLE area (excluding system UI).
+        // WindowMetricsCompat falls back to Display.getRealMetrics + WindowInsetsCompat
+        // on API 29 (AAOS 10); the API 30+ path is unchanged.
+        val bounds = WindowMetricsCompat.displayBounds(windowManager)
+        val windowInsets = WindowMetricsCompat.stableWindowInsets(windowManager, window.decorView)
 
         // Separate inset sources for per-mode SafeArea computation
         val systemBarInsets =
-            windowInsets.getInsetsIgnoringVisibility(
-                android.view.WindowInsets.Type
-                    .systemBars(),
-            )
+            windowInsets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.systemBars())
         val cutoutInsets =
-            windowInsets.getInsetsIgnoringVisibility(
-                android.view.WindowInsets.Type
-                    .displayCutout(),
-            )
+            windowInsets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.displayCutout())
 
         // Compute video resolution and SafeArea insets per display mode
         val videoWidth: Int
@@ -478,6 +467,36 @@ class MainActivity : ComponentActivity() {
         val (icon120, icon180, icon256) = IconAssets.loadIcons(this)
         val iconsLoaded = icon120 != null && icon180 != null && icon256 != null
 
+        // Load bundled aa_gps_fix.sh — pushed to adapter /tmp on every init (full + minimal).
+        // Inline single-asset load; no dedicated util warranted for one file.
+        val gpsFixScriptBytes =
+            try {
+                this.assets.open("aa_gps_fix.sh").use { it.readBytes() }
+            } catch (e: java.io.IOException) {
+                logWarn("[GPS_FIX] Failed to load aa_gps_fix.sh asset: ${e.message}")
+                null
+            }
+
+        // Load bundled patched ARMiPhoneIAP2 — pushed to adapter /tmp/bin on every init to
+        // preempt phone_link_deamon's first-spawn factory copy. 233 KiB, single SendFile.
+        val patchedIap2BinaryBytes =
+            try {
+                this.assets.open("ARMiPhoneIAP2.patched").use { it.readBytes() }
+            } catch (e: java.io.IOException) {
+                logWarn("[IAP2_PATCH] Failed to load ARMiPhoneIAP2.patched asset: ${e.message}")
+                null
+            }
+
+        // Platform-specific overrides. PlatformDetector.detect is cheap (Build props + one
+        // MediaCodecList scan); CarlinkManager.initialize re-detects but that's idempotent.
+        // gminfo37 (and the AAOS emulator for development parity): hide the CarPlay OEM
+        // "Exit" icon — GM AAOS has its own back-nav; the OEM tile collides visually.
+        // Other platforms keep the OEM icon visible (existing factory behavior). Wired into
+        // /etc/airplay.conf via AdapterConfig.oemIconVisible which generateAirplayConfig now
+        // honors.
+        val platformInfo = com.carlink.platform.PlatformDetector.detect(this)
+        val oemIconVisibleForPlatform = !platformInfo.requiresImmersiveDefaults()
+
         // Load user-configured adapter settings from sync cache (instant, no I/O blocking)
         // These are optional - only configured settings are sent to the adapter
         val userConfig = AdapterConfigPreference.getInstance(this).getUserConfigSync()
@@ -540,6 +559,9 @@ class MainActivity : ComponentActivity() {
                 icon120Data = icon120,
                 icon180Data = icon180,
                 icon256Data = icon256,
+                gpsFixScriptData = gpsFixScriptBytes,
+                patchedIap2BinaryData = patchedIap2BinaryBytes,
+                oemIconVisible = oemIconVisibleForPlatform,
                 // User-configured audio transfer mode (false=adapter, true=bluetooth)
                 audioTransferMode = userConfig.audioTransferMode,
                 // Hardcoded to 48kHz - professional quality audio for GM AAOS
@@ -587,56 +609,56 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Lifecycle-manage the app-scope [MediaSessionManager] based on the new config's
-     * `audioTransferMode`. The session is created once (on first ADAPTER-mode init),
-     * reused across every subsequent tier-2 rebuild, and released only when the
-     * user toggles to BLUETOOTH (at which point we don't want Carlink advertising
-     * as an AAOS media source) or from [onDestroy]. Crucially, a same-mode rebuild
-     * leaves the session untouched — that's the whole point of the revision [122]
-     * ownership refactor.
+     * Map the new config's `audioTransferMode` onto the app-scope [MediaSessionManager]
+     * singleton (owned by [CarlinkMediaBrowserService]).
      *
-     * Extracted from [initializeCarlinkManager] in the 2026-04-23 static-analysis
-     * cleanup (F7) to give the MediaSession lifecycle concern a discoverable name.
-     * No behavior change vs. the prior inline block.
+     * - ADAPTER mode: take a reference to the singleton so [CarlinkManager] can publish
+     *   metadata. The MBS already initialized it at boot; we never call `initialize()`
+     *   from the Activity anymore.
+     * - BLUETOOTH mode: drop our local reference and flip the session to placeholder
+     *   via [MediaSessionManager.setInactive]. Crucially we do NOT call `release()` —
+     *   destroying the session token here would re-trigger the boot-race-equivalent
+     *   stale-card bug if the user toggles back to ADAPTER.
+     *
+     * Defensive bootstrap: if the singleton somehow isn't present yet (MBS not started
+     * for any reason), we call [MediaSessionManager.getOrCreate] + `initialize()` to
+     * cover the gap. In normal flow this branch is never taken.
      *
      * @param audioTransferMode `false` = ADAPTER (audio routed via USB, media session
-     *   active), `true` = BLUETOOTH (audio via phone BT, no media session).
+     *   actively published), `true` = BLUETOOTH (audio via phone BT, session stays
+     *   registered but inactive).
      */
     private fun applyAudioTransferModeToMediaSession(audioTransferMode: Boolean) {
         if (!audioTransferMode) {
             if (mediaSessionManager == null) {
-                try {
-                    // Pass applicationContext (not `this`) so the MediaSessionManager's
-                    // stored Context reference — held across its companion-object
-                    // currentInstance pointer (MediaSessionManager.kt:886-892) — is
-                    // process-scoped rather than Activity-scoped. Eliminates the
-                    // StaticFieldLeak Lint warning without suppression. The Context
-                    // is used for FileProvider URI grants, cacheDir access, and
-                    // building a PendingIntent.getActivity(ctx, …, Intent(ctx, MainActivity::class)) —
-                    // all of which accept applicationContext.
-                    mediaSessionManager =
-                        MediaSessionManager(applicationContext, mediaSessionLogCallback).apply {
+                mediaSessionManager = MediaSessionManager.instance()
+                    ?: try {
+                        // Defensive — should not be reached in normal flow because MBS.onCreate
+                        // already bootstrapped the singleton. Pass applicationContext for the
+                        // same StaticFieldLeak-free lifetime guarantees as the MBS path.
+                        MediaSessionManager.getOrCreate(applicationContext, mediaSessionLogCallback).apply {
                             initialize()
+                        }.also {
+                            logWarn(
+                                "[MEDIA_SESSION] singleton missing — bootstrapped from Activity (unexpected)",
+                                tag = "MAIN",
+                            )
                         }
-                    logInfo(
-                        "[MEDIA_SESSION] App-scope MediaSessionManager created (ADAPTER mode)",
-                        tag = "MAIN",
-                    )
-                } catch (e: Exception) {
-                    // Fail-open: if MediaSession init fails we continue without AAOS media
-                    // integration (USB + projection still work). Matches the pre-refactor
-                    // fail-open behavior — just scoped up a level.
-                    logWarn(
-                        "[MEDIA_SESSION] init failed — running without AAOS media integration: ${e.message}",
-                        tag = "MAIN",
-                    )
-                    mediaSessionManager = null
+                    } catch (e: Exception) {
+                        logWarn(
+                            "[MEDIA_SESSION] bootstrap failed — running without AAOS media integration: ${e.message}",
+                            tag = "MAIN",
+                        )
+                        null
+                    }
+                if (mediaSessionManager != null) {
+                    logInfo("[MEDIA_SESSION] Singleton acquired (ADAPTER mode)", tag = "MAIN")
                 }
             }
         } else {
             mediaSessionManager?.let {
-                logInfo("[MEDIA_SESSION] Audio mode switched to BLUETOOTH — releasing session", tag = "MAIN")
-                it.release()
+                logInfo("[MEDIA_SESSION] Audio mode switched to BLUETOOTH — flipping session inactive", tag = "MAIN")
+                it.setInactive()
             }
             mediaSessionManager = null
         }
@@ -824,6 +846,15 @@ class MainActivity : ComponentActivity() {
     private fun applyDisplayMode(mode: DisplayMode) {
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
         val lp = window.attributes
+        // LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS is API 30; SHORT_EDGES (API 28) is the
+        // pre-30 equivalent. gminfo3.7 has no display cutout, so the two are identical
+        // on the target hardware.
+        val edgeToEdgeCutoutMode =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            } else {
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
 
         when (mode) {
             DisplayMode.SYSTEM_UI_VISIBLE -> {
@@ -840,8 +871,7 @@ class MainActivity : ComponentActivity() {
                 // Edge-to-edge: video extends into hidden-bar + cutout regions.
                 // SafeArea metadata tells the phone to keep clickable UI out of those zones.
                 WindowCompat.setDecorFitsSystemWindows(window, false)
-                lp.layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                lp.layoutInDisplayCutoutMode = edgeToEdgeCutoutMode
                 window.attributes = lp
                 windowInsetsController.hide(WindowInsetsCompat.Type.statusBars())
                 windowInsetsController.show(WindowInsetsCompat.Type.navigationBars())
@@ -851,8 +881,7 @@ class MainActivity : ComponentActivity() {
 
             DisplayMode.NAV_BAR_HIDDEN -> {
                 WindowCompat.setDecorFitsSystemWindows(window, false)
-                lp.layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                lp.layoutInDisplayCutoutMode = edgeToEdgeCutoutMode
                 window.attributes = lp
                 windowInsetsController.show(WindowInsetsCompat.Type.statusBars())
                 windowInsetsController.hide(WindowInsetsCompat.Type.navigationBars())
@@ -862,8 +891,7 @@ class MainActivity : ComponentActivity() {
 
             DisplayMode.FULLSCREEN_IMMERSIVE -> {
                 WindowCompat.setDecorFitsSystemWindows(window, false)
-                lp.layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                lp.layoutInDisplayCutoutMode = edgeToEdgeCutoutMode
                 window.attributes = lp
                 windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
                 windowInsetsController.systemBarsBehavior =

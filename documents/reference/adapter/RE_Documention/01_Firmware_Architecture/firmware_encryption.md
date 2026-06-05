@@ -1,7 +1,7 @@
 # CPC200-CCPA Firmware Encryption
 
 **Purpose:** Reverse engineering of Carlinkit .img firmware format
-**Consolidated from:** pi-carplay firmware analysis (January 2026)
+**Consolidated from:** firmware image extraction and analysis (January 2026)
 
 ---
 
@@ -17,6 +17,8 @@ This is **completely separate** from USB communication encryption (CMD_ENABLE_CR
 | USB Communication | AES-128-CTR | `W2EC1X1NbZ58TXtn` | Encrypt runtime USB traffic |
 
 See `03_Security_Analysis/crypto_stack.md` for complete cryptographic stack documentation.
+
+**See also:** The firmware-image AES here is also distinct from the **MFi authentication coprocessor** (a genuine Apple IC on I2C bus 1) — see the "MFi Authentication Coprocessor" subsection in `hardware_platform.md`. Do not conflate the firmware-image AES key with MFi credentials.
 
 ---
 

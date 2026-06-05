@@ -514,7 +514,12 @@ These commands simulate hardware navigation controls and are forwarded directly 
 - 501: May hide video view
 - 504: Lower volume of other audio sources
 - 505: Restore normal audio levels
-- 508: Echo back 508 to adapter (recommended precaution — testing was inconclusive on whether strictly required; nav video activation is primarily driven by `naviScreenInfo` in BoxSettings)
+- 508 (RequestNaviScreenFocus) — three-step handshake (discovered 2026-05-28 via live RE; see `video_protocol.md` "Handshake Sequence"):
+  1. Host sends Command(508) ~2 s after PLUGGED (proactive — not a reply).
+  2. Adapter sends Command(508) back.
+  3. Host echoes Command(508) again. After this the adapter completes `_AltScreenSetup` and emits Type 0x2C.
+  - On wired CarPlay the adapter has historically been observed to start at step 2 on its own (an echo-only host pattern works because the adapter initiates). On wireless CarPlay the adapter never initiates — it sends only 506 (audio nav focus). Transport-agnostic code should do both: send 508 proactively AND echo any incoming 508 — repeated 508s are idempotent.
+  - Live-verified on carlink_native + CPC200-CCPA firmware 2025.10.15.1127 (wireless CarPlay).
 
 ---
 
@@ -687,3 +692,10 @@ The following command IDs were NOT found in the switch table at `fcn.00019744`:
 - **Forwarding Log:** `"Forward CarPlay control cmd!"` at `0x6d18b`
 - **USB Protocol:** `usb_protocol.md`
 - **Audio Commands:** See AudioData (0x07) in `usb_protocol.md`
+
+### Related Message Types
+
+This file documents the Command (0x08) message payload only. Other USB message types that carry session-relevant data have their wire layouts documented elsewhere:
+
+- **Open (0x01)** — 28-byte payload (7 × uint32-LE: width, height, fps, format, packetMax, boxVersion, phoneMode). See `CAPTURE_SESSION.md` §9.1.1.
+- **BoxSettings (0x19)** — JSON body parsed into `/etc/riddle.conf`. See `CAPTURE_SESSION.md` §9.1.2.

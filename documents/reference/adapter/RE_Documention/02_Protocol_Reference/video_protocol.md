@@ -164,25 +164,60 @@ Verified from firmware switch statement at fcn.00017b74.
 
 **Requirements (Corrected Feb 2026):**
 - iOS 13+
-- Host must send `naviScreenInfo` in BoxSettings JSON — this is the **primary activation mechanism**. The firmware parses `naviScreenInfo` at `0x16e5c` and branches directly to the `HU_SCREEN_INFO` path, **bypassing** the `AdvancedFeatures` config check.
+- Host must send `naviScreenInfo` in BoxSettings JSON (USB type 0x19) — this is the **primary activation mechanism**. The firmware parses `naviScreenInfo` at `0x16e5c` and branches directly to the `HU_SCREEN_INFO` path, **bypassing** the `AdvancedFeatures` config check. For the BoxSettings wire layout see `CAPTURE_SESSION.md` §9.1.2; for the navigation-screen geometry path see §9.4.
 - `AdvancedFeatures=1` is **NOT required** when `naviScreenInfo` is provided (disproven by testing)
-- Command 508 handshake: **inconclusive** — the `pi-carplay` reference echoes 508 back, but testing could not isolate this as a requirement. Recommended as precaution.
+- Command 508 handshake: **inconclusive** — an echo-only pattern was previously observed to work, but testing could not isolate this as a requirement. Recommended as precaution.
 
-### Wireless CarPlay Navigation Video (TCP Stream Type 111)
+**naviScreenInfo + SafeArea (verified live 2026-05-28):**
 
-**IMPORTANT:** For **wireless** CarPlay sessions, navigation video is NOT delivered via USB message type 0x2C. Instead, it uses a separate WiFi TCP stream.
+```json
+{
+  "naviScreenInfo": {
+    "width":  1920,
+    "height": 620,
+    "fps":    30,
+    "safearea": {
+      "x":       100,
+      "y":         0,
+      "width":  1720,
+      "height":  620,
+      "outside":   0
+    }
+  }
+}
+```
 
-| Transport | Nav Video Mechanism | USB Type |
-|-----------|---------------------|----------|
-| Wired CarPlay | USB message 0x2C | Yes |
-| Wireless CarPlay | WiFi TCP (type 111) | No |
+| Field | Type | Meaning |
+|---|---|---|
+| `width` / `height` | int (pixels) | Cluster sandbox usable size. iPhone renders the CarPlay nav UI at this resolution. Must match the host's actual presentation surface — mismatch causes SurfaceFlinger to rescale, distorting aspect. |
+| `fps` | int | Frame rate to emit. iPhone honors this; typical values 24, 30. |
+| `safearea.x` / `safearea.y` | int (pixels) | Top-left origin of the safe rect within the screen geometry. |
+| `safearea.width` / `safearea.height` | int (pixels) | Size of the safe rect. iPhone keeps interactive UI (turn cards, lane guidance, speed-limit chips, controls) inside this. |
+| `safearea.outside` | 0/1 | `0` = area outside safe rect should stay host-rendered (iPhone doesn't paint UI there); `1` = iPhone may extend background/wallpaper outside, still keeps UI inside. Map backgrounds and other non-UI layers may bleed beyond regardless of this flag. |
+
+**Firmware path (verified):** `naviScreenInfo` parser at `fcn.00016c20`; persists to `/etc/RiddleBoxData/HU_NAVISCREEN_INFO` (geometry, 12 B LE: `width, height, fps`) and `/etc/RiddleBoxData/HU_NAVISCREEN_SAFEAREA_INFO` (20 B LE: `width, height, x, y, outside`). The firmware also simultaneously writes `HU_NAVISCREEN_VIEWAREA_INFO` (24 B: `width, height, x, y, 0, 0`). See `01_Firmware_Architecture/configuration.md` lines 898–915.
+
+**End-to-end confirmation (2026-05-28, AAOS emulator, wireless CarPlay):** carlink_native sends the above JSON in BoxSettings → adapter persists → wireless CarPlay session emits 1920×620@30 H.264 (adapter re-frames the AirPlay TCP type 111 stream as USB 0x2C for the host) → host forwards Annex-B over AIDL to a priv-app companion → MediaCodec renders into the cluster VirtualDisplay at 1:1 with no scaling. iPhone CarPlay UI elements (turn cards, ETA pills, speed limit chips) land inside the 1720×620 safe rect; map backgrounds extend to the full 1920×620 frame. For the full integration pattern see `04_Implementation/host_app_guide.md` §AltVideo → Cluster Display (USB 0x2C).
+
+### Wireless CarPlay Navigation Video
+
+**Correction 2026-05-28:** Earlier captures suggested wireless CarPlay nav video bypassed USB 0x2C entirely, but live testing against the A15W adapter shows otherwise — the adapter terminates the AirPlay TCP stream from the iPhone and **re-frames it as USB 0x2C for the host**, identically to wired sessions. From the host's POV the transport is the same 0x2C in both cases; the WiFi TCP type 111 layer exists only between iPhone and adapter.
+
+| Session | Transport iPhone → adapter | Transport adapter → host |
+|---|---|---|
+| Wired CarPlay   | USB iAP2 + lightning/USB-C | USB 0x2C |
+| Wireless CarPlay | WiFi AirPlay TCP stream type 111 | USB 0x2C (re-framed) |
 
 **Stream Types (AirPlay Protocol):**
 
-| Type | Purpose | Example Resolution |
-|------|---------|-------------------|
-| 110 | Main screen video | 1200×480 @ 60 FPS |
+`110` / `111` are the `type` field of the `displayInfo` / `viewAreas` descriptor in the AirPlay SETUP plist (`110` = main display, `111` = alt / cluster display). They originate in the `viewAreas` plist and are reused as the AirPlay `streams[].type`. The resolution is **not** a protocol constant — it is whatever the head unit advertised.
+
+| Type | Purpose | Example (varies by HU) |
+|------|---------|------------------------|
+| 110 | Main screen video | 2400×960 @ 60 FPS (2026-05-21 capture); 1200×480 @ 60 FPS (Jan 2026 capture) |
 | 111 | Alt screen (cluster/navigation) | 1000×400 @ 24 FPS (configurable 10-60, recommended 24-60) |
+
+Stream `type 111` is set up **only** when the head unit advertises an alt view area / `g_bSupportNaviScreen=1`. On the 2026-05-21 capture `g_bSupportNaviScreen` was 0, so only `type 110` was negotiated (`enabledFeatures:[viewAreas]`).
 
 **TTY Log Evidence (Jan 2026 Wireless CarPlay Capture):**
 ```
@@ -221,6 +256,63 @@ When capturing USB packets from a wireless CarPlay session:
 - USB capture only shows Type 6 (main video) going to the car's head unit
 - Navigation video goes directly via WiFi TCP to the adapter's AirPlay receiver
 - The adapter handles the two streams internally and may merge or route separately
+
+---
+
+## How the Head-Unit Resolution Reaches the iPhone
+
+**The iPhone renders CarPlay video to the resolution advertised in the AirPlay SETUP `viewAreas` / `displayInfo` plist** — specifically `viewAreas.widthPixels` / `viewAreas.heightPixels`. iAP2 carries **no** resolution; the resolution travels only on the AirPlay/RTSP channel (wireless) or is implied by the Open message (wired).
+
+### Path
+
+```
+host app Open(0x01) width/height ─▶ ARMadb-driver ProceessCmdOpen ─▶ auto-writes /etc/RiddleBoxData/HU_VIEWAREA_INFO
+   (or host SendFile(0x99) writes HU_VIEWAREA_INFO directly)
+                                              │
+AppleCarPlay._CopyDisplayDescriptions ────────┘  reads uint32[0]/uint32[1] of HU_VIEWAREA_INFO
+   (fcn.0001c0b4)
+                                              ▼
+   AirPlay SETUP  displayInfo/viewAreas{ widthPixels, heightPixels, safeArea{…} }  ─▶ iPhone
+```
+
+1. `AppleCarPlay._CopyDisplayDescriptions` (`fcn.0001c0b4`) reads `uint32[0]` (width) and `uint32[1]` (height) from `/etc/RiddleBoxData/HU_VIEWAREA_INFO`.
+2. `HU_VIEWAREA_INFO` is **auto-written by `ARMadb-driver` `ProceessCmdOpen`** from the host's Open (0x01) `width`/`height` fields whenever they differ from the stored value, **or** written directly via the `SendFile` (0x99) USB message.
+3. iAP2 (`IdentificationInformation`, msg `0x1D01`) carries **no resolution** — it advertises transports and message IDs only.
+
+### `viewAreas` / `displayInfo` plist schema
+
+The descriptor sent in the AirPlay SETUP request (`type` = 110 main / 111 alt):
+
+```
+displayInfo = [ {
+    type               : 110            ← 110 = main display, 111 = alt / cluster
+    uuid               : "<screen UUID>"
+    widthPixels        : <horizontal resolution the iPhone renders to>
+    heightPixels       : <vertical resolution the iPhone renders to>
+    maxFPS             : <e.g. 60>
+    widthPhysical      : <mm; 0 ⇒ iPhone derives DPI itself>
+    heightPhysical     : <mm; 0 ⇒ iPhone derives DPI itself>
+    features           : <display feature bitmask>
+    primaryInputDevice : <0 = touch is primary>
+    initialViewArea    : <index>
+    adjacentViewAreas  : [ … ]
+    viewAreas : [ {
+        widthPixels  : …   heightPixels : …
+        originXPixels : …  originYPixels : …
+        viewAreaStatusBarEdge     : <edge index>
+        viewAreaTransitionControl : <bool>
+        safeArea : {
+            widthPixels  : …   heightPixels : …
+            originXPixels : …  originYPixels : …
+            drawUIOutsideSafeArea : <bool>
+        }
+    } ]
+} ]
+```
+
+**2026-05-21 capture values:** `type:110`, `widthPixels:2400`, `heightPixels:960`, `maxFPS:60`, `widthPhysical:0`, `heightPhysical:0`, `features:10`, `primaryInputDevice:0`; nested `viewAreas[0]` = 2400×960 at origin (0,0), `safeArea` = 2400×960 at origin (0,0), `drawUIOutsideSafeArea:false`.
+
+See `CAPTURE_SESSION.md` §9.3.2 (the `viewAreas`/`displayInfo` descriptor) and §9.4 (resolution path, end to end).
 
 ---
 
@@ -292,11 +384,11 @@ When capturing USB packets from a wireless CarPlay session:
 | Parameter | Value |
 |-----------|-------|
 | **Profile** | High Profile (100) |
-| **Level** | 5.0 (Level IDC = 50) |
+| **Level** | Negotiated per session — not a fixed adapter constant (see note) |
 | **NAL Format** | Annex B (00 00 00 01 start codes) |
 | **SPS/PPS** | In-band with IDR frames |
 
-**Note:** Level 5.0 supports up to 4096×2304 @ 30fps, providing headroom for 2400×960 @ 60fps.
+**Note:** The H.264 level is **negotiated per session**, not hardcoded by the adapter. The iPhone advertises up to `h.264Level5.1` in the AirPlay SETUP `features` array; the level used depends on the resolution/FPS chosen for that session. The 2026-05-21 capture (2400×960 @ 60 FPS) used **Level 5.0** (avcc `01 64 00 32` — `level_idc = 0x32 = 50`). Level 5.0 supports up to 4096×2304 @ 30fps, providing headroom for 2400×960 @ 60fps.
 
 ### iPhone AVE Encoder Identity (iPhone Syslog, Mar 2026)
 
@@ -382,7 +474,7 @@ After sending an IDR, adapter may send type 0x3F1 to notify host.
 
 ### Comparison (Jan 2026 Capture)
 
-| Metric | format=5 (carlink_native) | format=1 (pi-carplay) |
+| Metric | format=5 (carlink_native) | format=1 (alternate-host capture) |
 |--------|--------------------------|------------------------|
 | IDR frames | 107 | 27 |
 | SPS repetitions | 118 | 33 |
@@ -584,10 +676,20 @@ The 2,735B IDR encodes the AA startup animation — a nearly uniform dark backgr
 
 ### Open Message Format Field
 
+The `format` value is the **4th of 7 uint32 little-endian fields** in the Open (USB type 0x01) 28-byte payload, at **payload offset 0xC**:
+
+```
+Open payload (28 B, 7 × uint32-LE):
+  0x00 width   0x04 height   0x08 fps   0x0C format
+  0x10 packetMax   0x14 boxVersion   0x18 phoneMode
+```
+
 | Value | Name | IDR Behavior |
 |-------|------|--------------|
 | 1 | Basic | Minimal IDR insertion (stream start only) |
 | 5 | Full H.264 | Responsive to Frame sync, aggressive IDR |
+
+See `CAPTURE_SESSION.md` §9.1.1 for the full Open message wire layout.
 
 ### Keyframe Recovery Flow
 
@@ -606,36 +708,55 @@ The 2,735B IDR encodes the AA startup animation — a nearly uniform dark backgr
 
 ## Navigation Video Protocol (iOS 13+)
 
-### Activation (Testing Verified Feb 2026)
+### Activation
 
-Navigation video is activated by **sending `naviScreenInfo` in BoxSettings**. This is the confirmed, tested primary mechanism. The firmware parses `naviScreenInfo` at `0x16e5c` and branches directly to `HU_SCREEN_INFO` path, bypassing the `AdvancedFeatures` config check.
+Navigation video activation requires **two conditions**:
 
-**`AdvancedFeatures=1` is NOT required** when `naviScreenInfo` is provided.
+1. **One-time persistent unlock.** `AdvancedFeatures=1` must have been processed by the adapter at least once in its lifetime, which causes ARMadb to write `/etc/RiddleBoxData/HU_NAVISCREEN_INFO`. This file persists across reboots and across reverting `AdvancedFeatures=0`. AppleCarPlay session-init reads it to set `g_bSupportNaviScreen=1`; without that, `_AltScreenSetup` is never called regardless of host signaling. (Originally documented during the Jan 2026 discovery of navigation video.)
+2. **Per-session activation.** Host sends `naviScreenInfo` in BoxSettings (Path A — recommended), OR `AdvancedFeatures=1` is currently set (Path B — legacy).
 
-### Handshake Sequence (INCONCLUSIVE)
+The firmware parses `naviScreenInfo` at `0x16e5c` and branches directly to `HU_SCREEN_INFO` (`0x170d6`), bypassing the **parser-side** `AdvancedFeatures` check. That bypass alone is insufficient on a virgin adapter, since `g_bSupportNaviScreen` won't be set — both gates must clear.
 
-The firmware binary shows a 508 handshake path, and the `pi-carplay` reference implementation echoes 508 back. However, **live testing with CarLink Native could not conclusively determine whether the 508 echo is required**.
+### Handshake Sequence — Three-Step (Discovered 2026-05-28)
 
-**Observed sequence:**
+Command 508 (RequestNaviScreenFocus) is documented in `command_details.md:509` as **BOTH**-direction. The full handshake is host-initiated and requires the host to send 508 **twice** — once to kick the focus negotiation, and once more to confirm after the adapter replies.
+
+**Discovery context:** the previous "INCONCLUSIVE" entry here was based only on an echo-only pattern that worked on wired CarPlay because the adapter sends 508 first there. On **wireless** CarPlay sessions (adapter WiFi AP) the adapter never sends 508 — it sends only 506 (audio nav focus). The full pattern below was discovered through live RE of the CPC200-CCPA wireless session.
+
+**The handshake (wireless, verified end-to-end on firmware 2025.10.15.1127, 2026-05-28):**
+
+| Step | Direction | Wire | When |
+|---|---|---|---|
+| 1 | host → adapter | Command(508) RequestNaviScreenFocus | ~2 s after PLUGGED, after `naviScreenInfo` BoxSettings has been sent |
+| 2 | adapter → host | Command(508) RequestNaviScreenFocus | adapter's reply to step 1 |
+| 3 | host → adapter | Command(508) RequestNaviScreenFocus | host echoes the step-2 reply to confirm |
+| 4 | adapter internal | HU_NEEDNAVI_STREAM D-Bus signal | adapter emits after step 3 |
+| 5 | adapter → host | Type 0x2C (NaviVideoData) frames | streaming begins |
+
+If step 1 is omitted on a wireless session, the adapter never sends step 2 (it sends only 506) and the handshake never starts. If step 3 is omitted, the adapter accepts step 1 but doesn't reach the emit path — `_AltScreenSetup` does not complete.
+
+**Wired CarPlay note:** on wired sessions the adapter has historically been observed to *initiate* with step 2 (echo-only host code works there). In transport-agnostic code, send step 1 proactively AND echo any incoming 508 — repeated 508s are idempotent.
+
+**Wire pattern:**
 ```
-1. Adapter sends Command 508 to host (RequestNaviScreenFocus)
-2. Host echoes Command 508 back to adapter (recommended but inconclusive if required)
-3. Adapter emits HU_NEEDNAVI_STREAM D-Bus signal
-4. Navigation video (Type 0x2C) streaming begins
+HOST                                       ADAPTER
+  |--- BoxSettings (naviScreenInfo) ------>|
+  |                                        |
+  |--- Command(508) step 1 --------------->|   (proactive, after PLUGGED+2s)
+  |                                        |   _AltScreenNegotiation entry
+  |<-- Command(508) step 2 ----------------|
+  |--- Command(508) step 3 --------------->|   (host echoes the reply)
+  |                                        |   _AltScreenSetup completes
+  |                                        |   HU_NEEDNAVI_STREAM
+  |<== Type 0x2C frames ===================|
 ```
 
-**pi-carplay implementation** (`src/main/carplay/services/CarplayService.ts:270-277`):
-```typescript
-if ((msg.value as number) === 508 && this.config.naviScreen?.enabled) {
-  this.driver.send(new SendCommand('requestNaviScreenFocus'))
-}
-```
-
-**Recommendation:** Echo 508 back if received (low cost, may be needed in some firmware paths), but the primary activation mechanism is `naviScreenInfo` in BoxSettings.
+All three documented gates must still clear independently: persistent unlock file (`AdvancedFeatures=1` written at least once), `naviScreenInfo` in BoxSettings, and `features=naviScreen` advertised in boxInfo. Those gates determine *eligibility*; the three-step handshake actually starts the stream.
 
 **Prerequisites for navigation video:**
-- `naviScreenInfo` must be sent in BoxSettings JSON (confirmed requirement)
-- `AdvancedFeatures=1` is NOT required when `naviScreenInfo` is provided
+- Adapter must have had `AdvancedFeatures=1` processed at least once (one-time persistent unlock — see Activation section). On virgin adapters, run `riddleBoxCfg -s AdvancedFeatures 1 && riddleBoxCfg --upConfig` once via SSH.
+- `naviScreenInfo` must be sent in BoxSettings JSON for Path A activation
+- After the one-time unlock, `AdvancedFeatures` can be left at 0 — Path A continues to work
 - CarPlay navigation app becomes active on phone
 - Host's `naviScreen.enabled` config must be true
 
@@ -922,16 +1043,16 @@ PPS: 68ca8f20 (4 bytes)
 
 **Main Video Header (20 bytes):**
 ```
-Offset  Field    CarPlay        Android Auto
-------  -----    -------        ------------
-0x00    Width    1280           1280
-0x04    Height   720            720
-0x08    Flags    0x007fdbaf     0x00000003
-0x0C    PTS      Variable       Variable
-0x10    Reserved 0              0
+Offset       Field         CarPlay        Android Auto
+-----------  ------------  -------        ------------
+0x00 (0x10)  Width         1280           1280
+0x04 (0x14)  Height        720            720
+0x08 (0x18)  EncoderState  0x007fdbaf     0x00000003
+0x0C (0x1C)  PTS           Variable       Variable
+0x10 (0x20)  Flags         0              0
 ```
 
-The Flags field differs significantly between protocols.
+Offsets in parentheses are relative to USB message start. The `EncoderState` field (offset 0x18) differs significantly between protocols — see the EncoderState Field Analysis above. (Earlier revisions of this table mislabeled offset 0x18 as "Flags"; the consistent name is **EncoderState**. "Flags" is offset 0x20.)
 
 ---
 
@@ -1304,12 +1425,11 @@ The app also generates a list of down-scaled and up-scaled resolution variants:
 
 - Source: `carlink_native/documents/reference/Firmware/firmware_video.md`
 - **Quantitative analysis:** `carlink_native/documents/video_code_reasoning/17_USB_CAPTURE_STREAM_ANALYSIS.md`
-- Source: `pi-carplay-4.1.3/firmware_binaries/2025.02/NAVIGATION_PROTOCOL_ANALYSIS.md`
-- **508 handshake verified:** `pi-carplay-main/src/main/carplay/services/CarplayService.ts` (Jan 2026)
+- **508 handshake verified:** live RE of CPC200-CCPA wireless CarPlay sessions (Jan–May 2026)
 - Binary analysis: `ARMadb-driver_unpacked`, `AppleCarPlay_unpacked` (Jan 2026)
 - Capture analysis: Jan 2026 (iPhone 18,4, Pixel 10)
 - Session examples: `../04_Implementation/session_examples.md`
-- **Jan 2026 Wireless CarPlay capture:** `picarplay-capture_26JAN22_02-45-40` - TCP type 111 alt screen verified
+- **Jan 2026 Wireless CarPlay capture:** USB capture `26JAN22_02-45-40` - TCP type 111 alt screen verified
 - **Jan 2026 Android Auto capture:** SSL handshake error codes verified (AaSdk logs)
 - **Mar 2026 CarPlay capture (Runs 1-6):** iPhone AVE encoder characterization, ForceKeyFrame lifecycle, DataRateLimits bitrate control, boot-screen IDR poisoning — see `video_pipeline_analysis/VIDEO_PIPELINE_DEEP_ANALYSIS.md`
 - **Mar 2026 iPhone syslog (Runs 4-6):** `idevicesyslog` capture confirming encoder identity, zero-drop behavior, RTSP 100% success rate

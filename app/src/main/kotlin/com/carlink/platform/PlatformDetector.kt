@@ -7,6 +7,7 @@ import android.os.Build
 import android.util.Log
 import android.view.WindowManager
 import com.carlink.BuildConfig
+import com.carlink.util.WindowMetricsCompat
 
 /**
  * PlatformDetector - Detects hardware platform characteristics for configuration selection.
@@ -87,6 +88,22 @@ object PlatformDetector {
          * sufficient for all cases in the audio/video config paths.
          */
         fun isGmInfo37(): Boolean = device.equals("gminfo37", ignoreCase = true)
+
+        /**
+         * Returns true if running on Google's AAOS reference emulator
+         * (product=sdk_gcar_arm64 / sdk_gcar_x86 / sdk_gcar_*). Used as a stand-in for
+         * gminfo37 during local development — same 3P-app constraints, and the only way
+         * to validate gminfo37-specific defaults without the Silverado hardware.
+         */
+        fun isAaosEmulator(): Boolean = product.startsWith("sdk_gcar", ignoreCase = true)
+
+        /**
+         * Composite: device should receive "gminfo37-like" UI defaults
+         * (fullscreen-immersive, OEM icon hidden, etc.). True on gminfo37 itself and
+         * on the AAOS emulator (for development parity). False elsewhere — preserves
+         * existing factory defaults for non-GM 3P targets.
+         */
+        fun requiresImmersiveDefaults(): Boolean = isGmInfo37() || isAaosEmulator()
 
         /**
          * Returns true if Intel-specific MediaCodec fixes should be applied.
@@ -176,8 +193,8 @@ object PlatformDetector {
         try {
             val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
             if (windowManager != null) {
-                // minSdk 32 >= API 30 (R), so currentWindowMetrics is always available
-                val bounds = windowManager.currentWindowMetrics.bounds
+                // WindowMetricsCompat: currentWindowMetrics on API 30+, getRealMetrics on API 29.
+                val bounds = WindowMetricsCompat.displayBounds(windowManager)
                 Pair(bounds.width(), bounds.height())
             } else {
                 Pair(0, 0)

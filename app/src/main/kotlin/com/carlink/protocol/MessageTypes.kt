@@ -501,7 +501,7 @@ enum class MultiTouchAction(
 /**
  * Known Carlinkit USB device identifiers (vendorId, productId).
  *
- * Sourced from pi-carplay USB captures and observed CPC200-CCPA variants. Consumed
+ * Sourced from USB captures and observed CPC200-CCPA variants. Consumed
  * by UsbDeviceWrapper.isKnownDevice at attach time; only these VID/PID pairs are
  * accepted. Add new pairs here if a newer adapter SKU ships with a different ID.
  */
@@ -564,6 +564,16 @@ data class AdapterConfig(
     val viewAreaData: ByteArray? = null,
     /** SafeArea binary data (20B) for adapter — always sent */
     val safeAreaData: ByteArray? = null,
+    /** Bundled aa_gps_fix.sh content (NMEA divisor in-memory patcher). Pushed to
+     *  /tmp/aa_gps_fix.sh on every init (full + minimal) because adapter power-cycle
+     *  between sessions wipes /tmp. Placement only — invocation is a separate step. */
+    val gpsFixScriptData: ByteArray? = null,
+    /** Bundled patched ARMiPhoneIAP2 (NaviJSON _iap2 + _iap2m roundabout recovery).
+     *  Pushed to /tmp/bin/ARMiPhoneIAP2 on every init to preempt phone_link_deamon's
+     *  factory-copy step, so the next CarPlay session execs our patched binary.
+     *  Atomic rename means a session in progress is unaffected (running iAP2 keeps
+     *  the old inode via mmap; next respawn picks up the new file). */
+    val patchedIap2BinaryData: ByteArray? = null,
 ) {
     companion object {
         val DEFAULT = AdapterConfig()

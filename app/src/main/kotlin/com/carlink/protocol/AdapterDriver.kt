@@ -35,10 +35,6 @@ import java.util.concurrent.atomic.AtomicLong
  *  - [isRunning] is the single gate: after [stop], every [send] silently returns
  *    false. Callers that need to distinguish "not running" from "send failed" must
  *    track state externally.
- *
- * External references: "pi-carplay" cited in several comments is an out-of-tree
- * project whose USB captures are mirrored under documents/reference/ — not a vendored
- * dependency. Treat it as the empirical source for timing and sequence decisions.
  */
 class AdapterDriver(
     private val usbDevice: UsbDeviceWrapper,
@@ -74,6 +70,12 @@ class AdapterDriver(
     private val heartbeatsSent = AtomicInteger(0)
     private val sessionStart = AtomicLong(0)
     private var initMessagesCount = 0
+
+    // Diagnostic: per-type message arrival counter. Emits a [TYPE_COUNTS_5s] summary
+    // every 5s on the USB read thread. Designed to prove which raw message types are
+    // flowing on USB without polluting logs with per-message [RECV] floods.
+    private val typeCounts = mutableMapOf<Int, Int>()
+    private var lastTypeDumpMs = 0L
 
     /**
      * Start the adapter communication with smart initialization.
@@ -127,8 +129,8 @@ class AdapterDriver(
         val allSent = initFailures == 0
         log("Initialization sequence completed (${initMessagesCount - initFailures}/$initMessagesCount sent)")
 
-        // Schedule wifiConnect with timeout (matches pi-carplay behavior; see
-        // documents/reference/ for the capture traces that pin down the 600 ms delay).
+        // Schedule wifiConnect with timeout (600 ms delay derived from capture traces
+        // under documents/reference/).
         wifiConnectTimer =
             Timer().apply {
                 schedule(
@@ -280,6 +282,28 @@ class AdapterDriver(
     }
 
     /**
+     * Write an arbitrary file to the connected adapter via USB SendFile (0x99).
+     *
+     * The adapter's ARMadb-driver handler stages the upload through
+     * /tmp/uploadFileTmp before atomically moving it to [adapterPath]. Path is
+     * not validated server-side — any absolute path the adapter root can write
+     * is reachable (see adapter RE_Documention §3 vulnerabilities.md). Used here
+     * only for /tmp/ paths (e.g. /tmp/aa_gps_fix.sh) for in-session host-pushed
+     * helpers. Naming a file `*Update.img` auto-triggers OTA on the adapter side
+     * — caller must avoid that suffix unless OTA is intended.
+     *
+     * @param adapterPath Absolute destination path on the adapter (e.g. "/tmp/aa_gps_fix.sh")
+     * @param content     Raw file bytes to write
+     */
+    fun sendFile(
+        adapterPath: String,
+        content: ByteArray,
+    ): Boolean {
+        log("[SEND] SendFile: $adapterPath (${content.size} bytes)")
+        return send(MessageSerializer.serializeFile(adapterPath, content))
+    }
+
+    /**
      * Cancel the pending wifiConnect auto-connect timer and send a targeted
      * AutoConnect_By_BluetoothAddress instead. Called when the user explicitly
      * selects a device to connect to during a restart cycle.
@@ -304,7 +328,7 @@ class AdapterDriver(
      * Send graceful teardown sequence. Must be called BEFORE stop()
      * since send() requires isRunning==true.
      *
-     * Sequence (from pi-carplay USB captures — see documents/reference/):
+     * Sequence (from USB captures — see documents/reference/):
      * 1. DisconnectPhone (0x0F) — end phone's CarPlay/AA session
      * 2. CloseDongle (0x15) — stop adapter internal processes
      * 3. RebootAdapter (0xCD) — optional full adapter reboot
@@ -365,6 +389,20 @@ class AdapterDriver(
                 ) {
                     messagesReceived.incrementAndGet()
                     bytesReceived.addAndGet((dataLength + HEADER_SIZE).toLong())
+
+                    // Diagnostic per-type tally — proves which raw message types are
+                    // arriving on USB without per-message log noise. Single-threaded
+                    // (USB read thread) so plain map mutation is safe.
+                    typeCounts[type] = (typeCounts[type] ?: 0) + 1
+                    val now = System.currentTimeMillis()
+                    if (now - lastTypeDumpMs > 5000L) {
+                        val summary = typeCounts.entries
+                            .sortedByDescending { it.value }
+                            .joinToString(", ") { "0x${it.key.toString(16).padStart(2, '0')}=${it.value}" }
+                        log("[TYPE_COUNTS_5s] $summary")
+                        typeCounts.clear()
+                        lastTypeDumpMs = now
+                    }
 
                     // For VIDEO_DATA with direct processing, data is null (processed directly by videoProcessor)
                     // Just signal the message handler that video is streaming

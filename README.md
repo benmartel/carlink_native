@@ -14,6 +14,25 @@ I did this app for me and my use, but sharing so others can use it. Don't expect
 
 ## Work In progress - Something is always changing.. Not always good
 
+> [!IMPORTANT]
+>
+> Limitations
+> Instrument Panel Cluster and Heads Up Display (HUD) Support
+>
+> Song Information:
+> Due to an AAOS bug. Song metadata displaying on the Cluster is hit or miss. The simplified explanation, the App creates a session 'token' and hands it to the OS. The Native Media Player and the Cluster both read song info from it. When the App crashes, force closes, or the OS sleeps the session dies. The App can't hand out a new one, the API only allows the token to be set once. The Native Media Player recovers down its own path, but the Cluster keeps holding the dead token and goes blank. Only an app reinstall or a head unit reboot will clear it. There are no known ways for third-party apps to fix this.
+>
+> Navigation Turn-By-Turn
+> Adapter firmware strips away nav details iPhones provide. It is narrows down to basic manuvers. The app forwards this to the cluster. CarPlay does not provide navigation icons. The app has its own internal set for CP. Android Auto does provide manuver images, which is forwarded to the cluster. They are more detailed and accurate.
+>
+> Vehicles running the GM VCU radio (most EVs and newer Fuel/ICE vehicles) on GM AAOS 14+ do not use any icon provided by the app. GM VMSPlugin still passes them, but the Cluster ECU ignores it and renders from its own internal icon set based on the manuver type. Earlier VCU vehicles on AAOS 12 or 13 may have behaved differently before being upgraded.
+>
+> My truck doesn't have an HUD, so i cannot test this. However, some Silverado and Hummer EV users have reported that the HUD does show navigation. I can only test for the software in my Silverado. GM and others can easily change how that is controlled so if it works, great. If it doesnt.. too bad.
+
+> [!TIP]
+> Before complaining about Audio issues.
+> 1. Disconnect and forget the Phone and Vehicle from each others Bluetooth. The adapter defaults to audio routing THROUGH the adapter for both microhone input and audio output. Make sure you allowed microphone access to the app.
+> 2. Steering Wheel Voice/Call Control doesn't work. That is a system-level app featuer and this is not that. If you want Steering Wheel Voice Controls, then ignore #1 and set the in-app adapter audio routing to Bluetooth. THe Phone and Vehicle will stay connected for ALL audio related events.
 
 > [!IMPORTANT]
 >My 2024 Silverado gminfo3.7 Intel AAOS radio is the target Platform and my only hardware for testing. 
@@ -36,6 +55,13 @@ Buffers create corruption. Queues create lies.
 >Video is a best-effort, disposable representation of UI state.
 Audio is a continuous time signal that must never stall.
 Video may drop. Audio may buffer. Neither may block the other
+
+> [!IMPORTANT]
+> Adapter-SIde Binaries were patched to correct to problems and require use of custom firmware on the adapter itself.
+> 1. Carlinkit Stripped away rich iAP2 navigation data rcvd from iPhone, that has been corrected in custom firmware. Full iAP2 route information is now forwarded and rcvd.
+> 2. Carlinkit AndroidAuto incorrectly parsed rcvd Vehicle GPS NMEA when app forwarded to Phone. That is now patched so correct and accura NMEA is rcvd by Android Phone.
+>
+> Custom adapter firmware for complete/correct Carplay Route information and Correct GPS-Forwarding support on Android Auto. While not necessary to have, it provides a better and closer to stock experience if you do load.
 
 ```
 Video:

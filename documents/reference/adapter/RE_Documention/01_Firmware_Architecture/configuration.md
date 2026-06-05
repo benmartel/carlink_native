@@ -1,7 +1,7 @@
 # CPC200-CCPA Configuration Reference
 
 **Purpose:** Complete riddleBoxCfg **[Firmware]** configuration keys reference — these are CPC200-CCPA adapter firmware settings (`/etc/riddle.conf`), not Android host app settings.
-**Consolidated from:** pi-carplay firmware analysis, carlink_native research
+**Consolidated from:** Firmware analysis and live RE
 **Last Updated:** 2026-02-19 (deduplicated heartbeat deep dive and D-Bus signal table; added direction/context labels)
 
 ---
@@ -746,6 +746,8 @@ echo 1 >/sys/class/gpio/gpio7/value   # Slow mode (default)
 | iOSMirror | Screen mirroring |
 | OnlyCharge | Charging only, no projection |
 
+**Note:** "AirPlay" here denotes the AirPlay/RTSP transport that CarPlay video+audio runs over (control port TCP 5000), not a distinct projection mode. CarPlay = AirPlay transport + iAP2.
+
 ---
 
 ## Navigation Video Parameters (iOS 13+)
@@ -755,12 +757,14 @@ echo 1 >/sys/class/gpio/gpio7/value   # Slow mode (default)
 
 **Purpose:** Controls instrument cluster / navigation video (CarPlay Dashboard) and NaviScreen view area negotiation.
 
-| Value | Global Flag Set | Feature |
-|-------|-----------------|---------|
-| 0 (default) | none | Navigation video only via `naviScreenInfo` in BoxSettings (bypass path). NaviScreen ViewArea/SafeArea disabled. |
-| 1 | `g_bSupportNaviScreen` | Navigation video stream (Type 0x2C AltVideoFrame) + NaviScreen ViewArea/SafeArea (legacy activation path) |
+| Value | Effect |
+|-------|--------|
+| 0 (default) | Used at runtime, navigation video flows via `naviScreenInfo` (Path A) — but **only if** the adapter has previously had this flag set to 1 (see "Persistent Unlock" below). On a virgin adapter, no 0x2C frames are emitted. |
+| 1 | Activates the legacy navigation-video path (Path B) and, on first use, creates the persistent unlock file. Sets `g_bSupportNaviScreen` and enables NaviScreen ViewArea/SafeArea negotiation. |
 
-**IMPORTANT (Testing Verified Feb 2026):** `AdvancedFeatures=1` is **NOT required** for navigation video when the host sends `naviScreenInfo` in BoxSettings. The firmware's JSON parser at `0x16e5c` checks for `naviScreenInfo` FIRST — if found, it branches directly to `HU_SCREEN_INFO` at `0x170d6`, completely bypassing the `AdvancedFeatures` check. Simply including `naviScreenInfo` in BoxSettings is the confirmed, tested activation mechanism.
+**Activation requires a one-time persistent unlock.** Setting `AdvancedFeatures=1` at least once in the device's lifetime causes ARMadb to write `/etc/RiddleBoxData/HU_NAVISCREEN_INFO`, which AppleCarPlay reads at session-init to set `g_bSupportNaviScreen`. The file persists across reboots and across reverting `AdvancedFeatures=0`. Without it, `_AltScreenSetup` is never called and no Type 0x2C frames flow — even when the host sends `naviScreenInfo` (the JSON parser bypass at `0x16e64` only clears the parser-side gate, not the session-init gate).
+
+The persistent-unlock behavior was originally observed and documented during the Jan 2026 discovery of navigation video. See "Navigation Video Activation" / "Persistent Unlock" sections below for the full activation matrix and binary trace.
 
 **CORRECTION (2026-02-18, r2 + live verified):** Earlier documentation incorrectly described this as a bitmask (0-3) with bit 1 controlling `g_bSupportViewarea`. This is **wrong**:
 - `riddleBoxCfg` enforces max=1 (`AdvancedFeatures:0 ~ 1`). Values 2+ are rejected.
@@ -824,7 +828,7 @@ drawUIOutsideSafeArea: 1   ← wallpaper fills to edges, everything else stays i
 
 | Config Key | Size | Struct (uint32 LE) | Purpose |
 |---|---|---|---|
-| `HU_VIEWAREA_INFO` | 24B (0x18) | `[width, height, width_dup, height_dup, 0, 0]` | Main screen viewable area rectangle |
+| `HU_VIEWAREA_INFO` | 24B (0x18) | `[width, height, width, height, originX, originY]` | Main screen view area: size (0x00/0x04), size duplicate (0x08/0x0C), origin (0x10/0x14). originX/Y=0,0 means full-screen. |
 | `HU_SAFEAREA_INFO` | 20B (0x14) | `[width, height, originX, originY, drawUIOutside]` | Main screen safe area insets + outside flag |
 
 **Navigation/Cluster Screen (gated by `g_bSupportNaviScreen` / AdvancedFeatures bit 0):**
@@ -848,7 +852,7 @@ This function builds the CarPlay display info dictionary during AirPlay session 
 2. Check g_bSupportViewarea (global at 0xabbe0)          ← set at init from HU_VIEWAREA_INFO file (NOT AdvancedFeatures)
    If 0 → skip to NaviScreen section
 3. Read HU_VIEWAREA_INFO (24 bytes) via fcn.00073d14
-   Validate width > 0 AND height > 0
+   Validate width > 0 AND height > 0 (at offsets 0x00 and 0x04)
 4. Build viewArea CFLDictionary:
    - "widthPixels"       = viewarea width
    - "heightPixels"      = viewarea height
@@ -882,9 +886,11 @@ This function builds the CarPlay display info dictionary during AirPlay session 
 
 #### ARMadb-driver: Auto-Update on Connection (ProceessCmdOpen)
 
-When a phone connects, `fcn.00021cb0` (ProceessCmdOpen) compares stored `HU_VIEWAREA_INFO` dimensions with the current screen dimensions from the Open message. If they differ, it auto-updates `HU_VIEWAREA_INFO` to match the new screen size (full-screen dimensions, origin 0,0). This ensures ViewArea always reflects the resolution declared in the Open message.
+When a phone connects, `fcn.00021cb0` (ProceessCmdOpen, handler entry `0x22098`; debug format string @`0x5e67f`) compares stored `HU_VIEWAREA_INFO` dimensions with the current screen dimensions from the Open message. If they differ, it auto-updates `HU_VIEWAREA_INFO` to match the new screen size (full-screen dimensions, origin 0,0). This ensures ViewArea always reflects the resolution declared in the Open message.
 
 **Key limitation:** This auto-update sets ViewArea = full screen dimensions. It does NOT update `HU_SAFEAREA_INFO`. SafeArea must be configured separately (see below).
+
+After auto-rewriting `HU_VIEWAREA_INFO`, the handler also **broadcasts the phone's resolution back to the host as message type `0x1E` (`RemoteCxCy`)**.
 
 #### ARMadb-driver: BoxSettings SafeArea Path (NaviScreen Only)
 
@@ -944,7 +950,7 @@ The firmware does NOT parse a main-screen `safearea` field from BoxSettings. Onl
 Previous documentation incorrectly stated `g_bSupportViewarea` is set by AdvancedFeatures bit 1. **This is wrong.**
 
 **Actual mechanism (r2 disassembly of AppleCarPlay init at ~0x16ca2, live-verified 2026-02-18):**
-- `g_bSupportViewarea` (global at 0xabbe0) is set to 1 during AppleCarPlay init **if and only if** `/etc/RiddleBoxData/HU_VIEWAREA_INFO` exists with valid dimensions (width > 0, height > 0 at offsets 0x08 and 0x0C)
+- `g_bSupportViewarea` (global at 0xabbe0) is set to 1 during AppleCarPlay init **if and only if** `/etc/RiddleBoxData/HU_VIEWAREA_INFO` exists with valid dimensions (width > 0, height > 0 at offsets 0x00 and 0x04 — the same fields _CopyDisplayDescriptions/fcn.0001c0b4 copies into viewAreas.widthPixels/heightPixels)
 - Fallback: also checks `HU_NAVISCREEN_VIEWAREA_INFO` — if that has valid dims, g_bSupportViewarea = 1
 - `AdvancedFeatures` only has **bit 0** tested in the entire firmware (`tst.w sb, 1` — no `tst.w sb, 2` exists). Max value is 1 (range-checked by riddleBoxCfg)
 - `g_bSupportNaviScreen` (AdvancedFeatures bit 0) → gates **NaviScreen** ViewArea/SafeArea (checks at 0x1c3a0)
@@ -1008,30 +1014,31 @@ If `naviScreenInfo` is NOT provided in BoxSettings:
 
 **Activation Matrix:**
 
-| naviScreenInfo in BoxSettings | AdvancedFeatures | Result |
-|------------------------------|------------------|--------|
-| Yes (any resolution) | 0 | ✅ **WORKS** (HU_SCREEN_INFO path) |
-| Yes (any resolution) | 1 | ✅ Works (same HU_SCREEN_INFO path) |
-| No | 1 | ✅ Works (HU_NAVISCREEN_INFO path) |
-| No | 0 | ❌ Rejected ("Not support NaviScreenInfo") |
+| `naviScreenInfo` in BoxSettings | `AdvancedFeatures` (current) | Persistent unlock present (`/etc/RiddleBoxData/HU_NAVISCREEN_INFO` exists) | Result |
+|---|---|---|---|
+| Yes | Either | Yes | ✅ Works (Path A — HU_SCREEN_INFO) |
+| Yes | Either | **No** (virgin adapter) | ❌ No 0x2C — JSON parser bypasses, but `g_bSupportNaviScreen=0` blocks `_AltScreenSetup` |
+| No | 1 | Yes | ✅ Works (Path B — HU_NAVISCREEN_INFO legacy) |
+| No | 0 | Either | ❌ Rejected (`"Not support NaviScreenInfo"`) |
 
-**Key Insight:** The `bne.w 0x170d6` at 0x16e64 is the critical branch that **bypasses** the AdvancedFeatures check entirely when naviScreenInfo is present.
+**Key Insight:** The `bne.w 0x170d6` branch at `0x16e64` only bypasses the **parser-side** `AdvancedFeatures` check. A **second, persistent gate** lives at the AppleCarPlay session-init layer: it reads `g_bSupportNaviScreen` from the file `/etc/RiddleBoxData/HU_NAVISCREEN_INFO`. ARMadb writes that file the first time it processes `AdvancedFeatures=1`, and the file survives reboots and reverting the flag to 0. Path A works regardless of the current `AdvancedFeatures` value, but **only after** `AdvancedFeatures=1` has been set at least once in the device's lifetime to create the unlock file.
 
 ---
 
-### AdvancedFeatures One-Time Activation (Legacy Behavior)
+### Persistent Unlock (Originally Documented Jan 2026)
 
-When using AdvancedFeatures (Path B), there is a one-time activation quirk:
+Coverage of this behavior was lost during a doc-folder reorganization and a subsequent Feb 2026 binary-RE pass that introduced (and over-generalized) the parser-bypass finding. Restored here.
 
-| Scenario | Navigation Video | Notes |
-|----------|------------------|-------|
-| Fresh adapter, AdvancedFeatures=0 (never set to 1) | **NOT working** | Feature locked (if no naviScreenInfo sent) |
-| Set AdvancedFeatures=1, connect phone | **Working** | Feature activated |
-| Set back to AdvancedFeatures=0 | **STILL working** | Feature remains unlocked |
+| Scenario | Navigation Video | Mechanism |
+|----------|------------------|-----------|
+| Virgin adapter (`AdvancedFeatures=1` never run), no `naviScreenInfo` | ❌ Not working | Both gates fail |
+| Virgin adapter, `naviScreenInfo` sent | ❌ Not working | Parser bypasses, but `g_bSupportNaviScreen=0` |
+| Run `riddleBoxCfg -s AdvancedFeatures 1 && --upConfig` once | ✅ Activated | ARMadb writes `/etc/RiddleBoxData/HU_NAVISCREEN_INFO` |
+| Then set `AdvancedFeatures=0`, send `naviScreenInfo` (Path A) | ✅ Still working | Unlock file persists |
+| Then set `AdvancedFeatures=0`, omit `naviScreenInfo` (Path B) | ❌ Not working | Legacy path requires runtime `=1` |
+| Manually delete `AdvancedFeatures` line from `riddle.conf` | (re-emitted on next config sync) | `riddleBoxCfg` re-injects from default schema; unlock state lives in `/etc/RiddleBoxData/`, not `riddle.conf` |
 
-This suggests a persistent unlock flag is set on first activation.
-
-**Note:** This quirk does NOT apply when using Path A (naviScreenInfo in BoxSettings) - that path works regardless of AdvancedFeatures history.
+**Practical guidance:** A host app cannot rely on `naviScreenInfo` alone if it might run against a virgin adapter. Options: (a) require a one-time SSH unlock by the user, or (b) ship the unlock as a first-run setup step if the host has shell access to the adapter.
 
 ### naviScreenWidth
 **Type:** Number (0-4096) | **Default:** 480
@@ -1069,79 +1076,73 @@ Host applications configure navigation video via BoxSettings JSON:
 ```
 
 **Requirements (when using naviScreenInfo Path A):**
-1. Host must send `naviScreenInfo` in BoxSettings (0x19) JSON — **this is the only confirmed requirement**
-2. Host must handle NaviVideoData (Type 0x2C) messages
-3. Command 508 handshake: recommended to echo 508 back if received, but **testing was inconclusive** on whether this is strictly required
+1. The adapter must have had `AdvancedFeatures=1` set at least once in its lifetime — the file `/etc/RiddleBoxData/HU_NAVISCREEN_INFO` must exist (persistent unlock — see above). On a virgin adapter, run `riddleBoxCfg -s AdvancedFeatures 1 && riddleBoxCfg --upConfig` once via SSH. After that, `AdvancedFeatures` can be left at 0 and Path A continues to work.
+2. Host must send `naviScreenInfo` in BoxSettings (0x19) JSON.
+3. Host must handle NaviVideoData (Type 0x2C) messages.
+4. Command 508 handshake: recommended to echo 508 back if received, but testing was inconclusive on whether this is strictly required.
 
-**Note:** When `naviScreenInfo` is present in BoxSettings, it **bypasses** the AdvancedFeatures check entirely. The firmware branches directly to the HU_SCREEN_INFO path. See "Navigation Video Activation" section above for the binary-verified control flow.
+**Note:** `naviScreenInfo` bypasses the `AdvancedFeatures` check **only in the JSON parser** (firmware branch at `0x16e64` → HU_SCREEN_INFO path). It does NOT bypass the AppleCarPlay session-init check on `g_bSupportNaviScreen`, which reads the persistent `/etc/RiddleBoxData/HU_NAVISCREEN_INFO` file. See "Persistent Unlock" above.
 
 ---
 
-## BoxSettings JSON Mapping (Binary Verified Jan 2026)
+## BoxSettings JSON Mapping (Binary Verified Jan 2026; capture-verified May 2026)
 
 **⚠️ SECURITY WARNING:** The `wifiName`, `btName`, and `oemIconLabel` fields are vulnerable to **command injection**. See `03_Security_Analysis/vulnerabilities.md`.
 
-### Host to Adapter Fields **[Host→Adapter]** - Complete List
+### BoxSettings Parser
 
-**Core Configuration:**
+BoxSettings (USB type `0x19`) JSON is parsed by `ARMadb-driver` `FUN_00016c20` (dispatched from `FUN_0001dd98`). The **same parser also serves command `0xA2` `CMD_APP_SET_BOX_CONFIG`**. The generic path `FUN_0001658c` walks a **29-entry field→key table at `0x93f90`**: a cJSON string value goes through `SetBoxConfigStr`, a number through `SetBoxConfig` → `/etc/riddle.conf`. A handful of fields are intercepted *before* the table and are NOT stored in riddle.conf (see "BoxSettings special handlers" below).
 
-| JSON Field | riddle.conf | Type | Description |
-|------------|-------------|------|-------------|
-| `mediaDelay` | `MediaLatency` | int | Audio buffer (ms) |
-| `syncTime` | - | int | Unix timestamp |
-| `autoConn` | `NeedAutoConnect` | bool | Auto-reconnect flag |
-| `autoPlay` | `AutoPlay` | bool | Auto-start playback |
-| `autoDisplay` | - | bool | Auto display mode |
-| `bgMode` | `BackgroundMode` | int | Background mode |
-| `startDelay` | `BoxConfig_DelayStart` | int | Startup delay (sec) |
-| `syncMode` | - | int | Sync mode |
-| `lang` | - | string | Language code |
+### Host to Adapter Fields **[Host→Adapter]** — verified 29-entry table (@0x93f90)
 
-**Display / Video:**
+| # | JSON Field | riddle.conf Key | Description |
+|---|------------|-----------------|-------------|
+| 0 | `btName` | CustomBluetoothName | Bluetooth name ⚠️ **CMD INJECTION** |
+| 1 | `wifiName` | CustomWifiName | WiFi SSID ⚠️ **CMD INJECTION** |
+| 2 | `fps` | CustomFrameRate | → `Open` fps field |
+| 3 | `gps` | HudGPSSwitch | GPS/dashboard enable |
+| 4 | `lang` | BoxConfig_UI_Lang | UI language |
+| 5 | `bgMode` | BackgroundMode | Connection-UI visibility |
+| 6 | `syncMode` | iAP2TransMode | iAP2 framing mode |
+| 7 | `startDelay` | BoxConfig_DelayStart | USB init delay (sec) |
+| 8 | `mediaDelay` | MediaLatency | Audio buffer (ms) |
+| 9 | `mediaSound` | MediaQuality | 0=44.1kHz, 1=48kHz PCM |
+| 10 | `autoConn` | NeedAutoConnect | Auto-reconnect flag |
+| 11 | `androidWorkMode` | AndroidWorkMode | AA daemon mode (0-5) |
+| 12 | `drivePosition` | CarDrivePosition | 0=LHD, 1=RHD |
+| 13 | `echoDelay` | EchoLatency | WebRTC AEC delay |
+| 14 | `androidAutoSizeW` | AndroidAutoWidth | AA video width |
+| 15 | `androidAutoSizeH` | AndroidAutoHeight | AA video height |
+| 16 | `screenPhysicalW` | ScreenPhysicalW | Physical screen width (mm) → CarPlay DPI |
+| 17 | `screenPhysicalH` | ScreenPhysicalH | Physical screen height (mm) → CarPlay DPI |
+| 18 | `brand` | CarBrand | OEM brand |
+| 19 | `ScreenDPI` | ScreenDPI | CarPlay render density |
+| 20 | `boxName` | CustomBoxName | Device display name |
+| 21 | `WiFiChannel` | WiFiChannel | Adapter AP channel |
+| 22 | `UseBTPhone` | UseBTPhone | Route calls via BT-HFP |
+| 23 | `HiCarConnectMode` | HiCarConnectMode | HiCar connection mode |
+| 24 | `GNSSCapability` | GNSSCapability | GPS capability advertised |
+| 25 | `AutoResetUSB` | AutoResetUSB | USB reset on disconnect |
+| 26 | `DashboardInfo` | DashboardInfo | Cluster/dashboard capability bitmask |
+| 27 | `DayNightMode` | DayNightMode | Day/night mode |
+| 28 | `DockPosition` | DuckPosition | (firmware key typo) |
 
-| JSON Field | riddle.conf | Type | Description |
-|------------|-------------|------|-------------|
-| `androidAutoSizeW` | `AndroidAutoWidth` | int | Android Auto width |
-| `androidAutoSizeH` | `AndroidAutoHeight` | int | Android Auto height |
-| `screenPhysicalW` | - | int | Physical screen width (mm) |
-| `screenPhysicalH` | - | int | Physical screen height (mm) |
-| `drivePosition` | `CarDrivePosition` | int | 0=LHD, 1=RHD |
+> The dead keys `oemName` and `lightType` are **not** in the BoxSettings table — they are not reachable via type `0x19` JSON. `productType` is an adapter→host field only.
 
-**Audio:**
+### BoxSettings special handlers (not stored in riddle.conf)
 
-| JSON Field | riddle.conf | Type | Description |
-|------------|-------------|------|-------------|
-| `mediaSound` | `MediaQuality` | int | 0=44.1kHz, 1=48kHz |
-| `mediaVol` | - | float | Media volume (0.0-1.0) |
-| `navVol` | - | float | Navigation volume |
-| `callVol` | - | float | Call volume |
-| `ringVol` | - | float | Ring volume |
-| `speechVol` | - | float | Speech/Siri volume |
-| `otherVol` | - | float | Other audio volume |
-| `echoDelay` | `EchoLatency` | int | Echo cancellation (ms) |
-| `callQuality` | `CallQuality` | int | Voice call quality |
+These fields are intercepted before the field→key table; they take effect directly and write nothing to `/etc/riddle.conf`:
 
-**Network / Connectivity:**
+| JSON Field | Target | Mechanism |
+|------------|--------|-----------|
+| `syncTime` | system clock | `settimeofday(val + 28800)` — hardcoded UTC+8 offset |
+| `mediaVol`/`callVol`/`speechVol`/`ringVol`/`navVol`/`otherVol` | `HU_AUDIOVOLUME_INFO[0..5]` | shared memory |
+| `naviScreenInfo{width,height,fps}` | `HU_NAVISCREEN_INFO` (24B) | shared memory |
+| `naviScreenInfo.safearea{width,height,x,y,outside}` | `HU_NAVISCREEN_SAFEAREA_INFO` (20B) + `HU_NAVISCREEN_VIEWAREA_INFO` (24B) | shared memory |
 
-| JSON Field | riddle.conf | Type | Description |
-|------------|-------------|------|-------------|
-| `wifiName` | `CustomWifiName` | string | WiFi SSID ⚠️ **CMD INJECTION** |
-| `wifiFormat` | - | int | WiFi format |
-| `WiFiChannel` | `WiFiChannel` | int | WiFi channel (1-11, 36-165) |
-| `btName` | `CustomBluetoothName` | string | Bluetooth name ⚠️ **CMD INJECTION** |
-| `btFormat` | - | int | Bluetooth format |
-| `boxName` | `CustomBoxName` | string | Device display name |
-| `iAP2TransMode` | `iAP2TransMode` | int | iAP2 transport mode |
+**There is no BoxSettings field for the main-screen SafeArea** — `HU_SAFEAREA_INFO` is only settable via `SendFile` (type `0x99`) or SSH.
 
-**Branding / OEM:**
-
-| JSON Field | riddle.conf | Type | Description |
-|------------|-------------|------|-------------|
-| `oemName` | - | string | OEM name |
-| `productType` | - | string | Product type (e.g., "A15W") |
-| `lightType` | - | int | LED indicator type |
-
-**Navigation Video (activated by sending `naviScreenInfo` — AdvancedFeatures NOT required):**
+**Navigation Video (sent via `naviScreenInfo` — requires one-time `AdvancedFeatures=1` unlock; see "Persistent Unlock"):**
 
 | JSON Field | Type | Description |
 |------------|------|-------------|
@@ -1424,7 +1425,7 @@ Each riddle.conf parameter can be set through different mechanisms. Understandin
 
 | Mechanism | Description | When Used |
 |-----------|-------------|-----------|
-| **Host App (0x19)** | BoxSettings JSON sent via USB message type 0x19 | Host app (pi-carplay, AutoKit) sends config during session |
+| **Host App (0x19)** | BoxSettings JSON sent via USB message type 0x19 | Host app (e.g. AutoKit) sends config during session |
 | **riddleBoxCfg CLI** | Command-line tool on adapter: `riddleBoxCfg -s Key Value` | SSH access, scripts, OEM provisioning |
 | **Auto (Connect)** | Firmware sets automatically when device connects | DevList, LastConnectedDevice, LastPhoneSpsPps |
 | **Auto (Pair)** | Firmware sets automatically during Bluetooth pairing | DevList entries, PHONE_INFO |
@@ -1433,31 +1434,45 @@ Each riddle.conf parameter can be set through different mechanisms. Understandin
 
 ### BoxSettings JSON → riddle.conf Mapping
 
-When host app sends BoxSettings (0x19), these JSON fields map to config keys:
+When host app sends BoxSettings (0x19), these JSON fields map to config keys. This is the verified 29-entry field→key table at `0x93f90` (walked by `FUN_0001658c`); the same parser `FUN_00016c20` also serves command `0xA2` `CMD_APP_SET_BOX_CONFIG`:
 
 | BoxSettings JSON | riddle.conf Key | Notes |
 |------------------|-----------------|-------|
-| `mediaDelay` | MediaLatency | Audio buffer (ms) |
-| `autoConn` | NeedAutoConnect | Auto-reconnect toggle |
-| `autoPlay` | AutoPlauMusic | ⚠️ **MAPPING MISSING** — `autoPlay` string absent from ARMadb-driver; config key exists but not reachable via BoxSettings JSON. Set via web UI only. |
-| `autoDisplay` | autoDisplay | Auto display mode |
-| `bgMode` | BackgroundMode | Background mode |
-| `startDelay` | BoxConfig_DelayStart | Startup delay |
+| `btName` | CustomBluetoothName | Bluetooth name ⚠️ CMD INJECTION |
+| `wifiName` | CustomWifiName | WiFi SSID ⚠️ CMD INJECTION |
+| `fps` | CustomFrameRate | → Open fps field |
+| `gps` | HudGPSSwitch | GPS/dashboard enable |
 | `lang` | BoxConfig_UI_Lang | UI language |
+| `bgMode` | BackgroundMode | Background mode |
+| `syncMode` | iAP2TransMode | iAP2 framing mode |
+| `startDelay` | BoxConfig_DelayStart | Startup delay |
+| `mediaDelay` | MediaLatency | Audio buffer (ms) |
+| `mediaSound` | MediaQuality | 0=44.1kHz, 1=48kHz |
+| `autoConn` | NeedAutoConnect | Auto-reconnect toggle |
+| `androidWorkMode` | AndroidWorkMode | AA daemon mode |
+| `drivePosition` | CarDrivePosition | 0=LHD, 1=RHD |
+| `echoDelay` | EchoLatency | Echo cancellation |
 | `androidAutoSizeW` | AndroidAutoWidth | AA resolution |
 | `androidAutoSizeH` | AndroidAutoHeight | AA resolution |
 | `screenPhysicalW` | ScreenPhysicalW | Physical size (mm) |
 | `screenPhysicalH` | ScreenPhysicalH | Physical size (mm) |
-| `drivePosition` | CarDrivePosition | 0=LHD, 1=RHD |
-| `mediaSound` | MediaQuality | 0=44.1kHz, 1=48kHz |
-| `echoDelay` | EchoLatency | Echo cancellation |
-| `callQuality` | CallQuality | **BUGGY** - translation fails |
-| `wifiName` | CustomWifiName | WiFi SSID |
-| `WiFiChannel` | WiFiChannel | WiFi channel |
-| `btName` | CustomBluetoothName | Bluetooth name |
+| `brand` | CarBrand | OEM brand |
+| `ScreenDPI` | ScreenDPI | CarPlay render density |
 | `boxName` | CustomBoxName | Display name |
-| `iAP2TransMode` | iAP2TransMode | Transport mode |
-| `androidWorkMode` | AndroidWorkMode | AA daemon mode |
+| `WiFiChannel` | WiFiChannel | WiFi channel |
+| `UseBTPhone` | UseBTPhone | Route calls via BT-HFP |
+| `HiCarConnectMode` | HiCarConnectMode | HiCar connection mode |
+| `GNSSCapability` | GNSSCapability | GPS capability advertised |
+| `AutoResetUSB` | AutoResetUSB | USB reset on disconnect |
+| `DashboardInfo` | DashboardInfo | Cluster capability bitmask |
+| `DayNightMode` | DayNightMode | Day/night mode |
+| `DockPosition` | DuckPosition | (firmware key typo) |
+
+> `autoPlay` is **not** in this table — `AutoPlauMusic` is settable via the web UI only (the `autoPlay` string is absent from the ARMadb-driver table). `oemName` and `lightType` are likewise absent from BoxSettings. `callQuality` is not in the 29-entry table either; see the CallQuality bug notes elsewhere. Special handlers (`syncTime`, `*Vol`, `naviScreenInfo`) are intercepted before this table — see "BoxSettings special handlers".
+
+### MiddleMan IPC
+
+`ARMadb-driver` is the USB protocol handler and acts as the **MiddleManServer**. The CarPlay daemons connect back as MiddleMan clients over an **abstract-namespace `AF_UNIX` socket**, tagged with a `RiddleLinktype` (CarPlay = 3). Most session configuration is *not* carried over this socket: `AppleCarPlay` and `ARMiPhoneIAP2` read config directly from `/etc/riddle.conf` and the `/etc/RiddleBoxData/HU_*` geometry files at session init.
 
 ### Auto-Set Parameters (Firmware Managed)
 
@@ -1726,7 +1741,7 @@ Set via web interface at `http://192.168.43.1` (or `http://192.168.50.2`). User-
 **Examples**: WiFiChannel, MediaLatency, MediaQuality, MicType, MouseMode, BackgroundMode, CustomWifiName
 
 ### Protocol Init Parameters
-Set by host applications (carlink_native, pi-carplay, AutoKit) during USB protocol initialization. These are sent as BoxSettings and may override riddle.conf values.
+Set by host applications (e.g. AutoKit) during USB protocol initialization. These are sent as BoxSettings and may override riddle.conf values.
 
 **Examples**: SpsPpsMode, RepeatKeyframe, VideoBitRate, VideoResolutionWidth/Height, FastConnect, NeedKeyFrame, AndroidWorkMode, CustomFrameRate, ScreenDPI
 
@@ -1844,6 +1859,18 @@ This section documents which configuration keys can be set via USB protocol mess
 ### Host App Configurable Keys (USB Protocol)
 
 #### Via Open Message (0x01) - Session Parameters
+
+The Open payload is a 28-byte body, 7 × uint32 little-endian:
+
+| Offset | Field | Effect |
+|--------|-------|--------|
+| 0x00 | `width` | Display / video encoder width |
+| 0x04 | `height` | Display / video encoder height |
+| 0x08 | `fps` | Video framerate (← `CustomFrameRate`) |
+| 0x0C | `format` | Video format ID (1 = basic IDR, 5 = full H.264 / aggressive IDR) |
+| 0x10 | `packetMax` | Max packet size (e.g. 0xC000) |
+| 0x14 | `boxVersion` | Protocol version (e.g. 2) |
+| 0x18 | `phoneMode` | iPhone work mode — `2` = CarPlay |
 
 | Key | Protocol Field | Effect |
 |-----|----------------|--------|
@@ -2038,19 +2065,19 @@ See `usb_protocol.md` → "Bluetooth PIN Message Types" for detailed flow.
 
 ### Critical Note: Navigation Video Configuration
 
-There are **two independent paths** to enable navigation video (see "Navigation Video Activation" section for binary-verified details):
+There are **two activation paths** for navigation video at runtime, but **both require a one-time `AdvancedFeatures=1` unlock** (originally documented during the Jan 2026 navigation-video discovery). See "Navigation Video Activation" / "Persistent Unlock" sections above for binary-verified details.
 
 **Path A: naviScreenInfo in BoxSettings (Host App Controlled)**
 - Host sends `naviScreenInfo: {width, height, fps}` in BoxSettings JSON
-- Firmware at 0x16e64 detects naviScreenInfo and **bypasses** the AdvancedFeatures check
-- Uses HU_SCREEN_INFO D-Bus path
-- ✅ **Works without AdvancedFeatures=1**
+- Firmware at `0x16e64` detects `naviScreenInfo` and bypasses the **parser-side** `AdvancedFeatures` check (HU_SCREEN_INFO D-Bus path)
+- ⚠️ Still requires the persistent unlock file `/etc/RiddleBoxData/HU_NAVISCREEN_INFO`, created the first time `AdvancedFeatures=1` is processed
+- ✅ Works with `AdvancedFeatures=0` at runtime, **provided** the adapter has had `AdvancedFeatures=1` set at least once in its lifetime
 
-**Path B: AdvancedFeatures=1 (Legacy, Direct Access Only)**
+**Path B: AdvancedFeatures=1 at runtime (Legacy, Direct Access Only)**
 - Set via `riddleBoxCfg -s AdvancedFeatures 1` (SSH/terminal only)
 - Uses HU_NAVISCREEN_INFO D-Bus path
-- Uses naviScreenWidth/naviScreenHeight/naviScreenFPS from riddle.conf
-- Required only if host does NOT send naviScreenInfo in BoxSettings
+- Uses `naviScreenWidth` / `naviScreenHeight` / `naviScreenFPS` from `riddle.conf`
+- Required only if host does NOT send `naviScreenInfo` in BoxSettings
 
 **AdvancedFeatures Effects (when set to 1):**
 - Sets `g_bSupportNaviScreen=1` in AppleCarPlay
@@ -2119,8 +2146,6 @@ Runtime Configuration Changes:
 
 ## References
 
-- Source: `pi-carplay-4.1.3/firmware_binaries/CONFIG_KEYS_REFERENCE.md`
-- Source: `carlink_native/documents/reference/Firmware/firmware_configurables.md`
 - Source: Binary analysis of `riddleBoxCfg_unpacked` (49KB, 2025.10 firmware)
 - Source: Binary analysis of `ARMadb-driver_2025.10_unpacked` (478KB)
 - Firmware strings analyzed using: `strings -t x`, `objdump -d`, `radare2`

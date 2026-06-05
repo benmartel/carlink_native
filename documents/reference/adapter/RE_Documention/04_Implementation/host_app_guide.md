@@ -157,6 +157,27 @@ t=2000ms  → First heartbeat (timer fires)
 t=4000ms  → Second heartbeat
 ```
 
+**Resolution path, end-to-end (capture-verified 2026-05-21):**
+
+The `width`/`height` you put in the `Open` (0x01) message is what the iPhone ultimately renders
+to, but the value travels through several adapter-internal stages:
+
+```
+host Open(0x01) w/h
+  → ARMadb-driver ProceessCmdOpen          (rewrites /etc/RiddleBoxData/HU_VIEWAREA_INFO)
+  → AppleCarPlay._CopyDisplayDescriptions  (reads HU_VIEWAREA_INFO + HU_SAFEAREA_INFO)
+  → AirPlay SETUP  viewAreas{ widthPixels, heightPixels, safeArea{...} }
+  → iPhone
+```
+
+- iAP2 `0x1D01 IdentificationInformation` (sent over BT before WiFi exists) carries **no
+  resolution** — it advertises transports / vehicle identity / message IDs only.
+- **DPI is a separate path:** `riddleBoxCfg ScreenPhysicalW/H` → AirPlay `widthPhysical` /
+  `heightPhysical`. When both are `0` the iPhone derives DPI itself.
+
+See § *HU_\* Geometry Structs (/etc/RiddleBoxData/)* and the *Open Message* section below for
+the struct layouts and the `ProceessCmdOpen` side effect.
+
 ### 3. Message Processing Loop
 
 ```
@@ -438,6 +459,35 @@ fun sendMultiTouch(points: List<TouchPoint>) {
 
 ## Configuration
 
+### riddleBoxCfg — Persistent Config Store
+
+The adapter's persistent configuration lives in **`/etc/riddle.conf`** (JSON key:value), with a
+factory backup at **`/etc/riddle_default.conf`**. It is read/written from the shell via the CLI
+`riddleBoxCfg <Key> [Value]` (read with the key alone, write with key + value). `ARMadb-driver`'s
+`BoxSettings` parser ultimately writes the same file (see the 29-key mapping table below).
+
+Capability keys that change what the iPhone is told about the head unit:
+
+| Key | Effect |
+|-----|--------|
+| `CustomFrameRate` | frame rate → `Open` fps field |
+| `VideoResolutionWidth` / `VideoResolutionHeight` | display resolution |
+| `ScreenDPI` | CarPlay render density |
+| `ScreenPhysicalW` / `ScreenPhysicalH` | physical mm → AirPlay `widthPhysical`/`heightPhysical` (0 ⇒ iPhone derives DPI) |
+| `CarBrand` | OEM brand (rewrites airplay.conf + logo) |
+| `WiFiChannel` | adapter AP channel |
+| `CarDrivePosition` | 0=LHD, 1=RHD |
+| `DayNightMode` | day/night mode |
+| `GNSSCapability` | GPS capability advertised over iAP2 |
+| `DashboardInfo` | cluster/dashboard bitmask — bit0 media-player, bit1 vehicle-status, bit2 route-guidance |
+| `AdvancedFeatures` | gates `g_bSupportNaviScreen` (CarPlay nav/cluster video) |
+
+> **Adapter-side iPhone handshake.** The iPhone↔adapter pairing — iAP2 over BT RFCOMM → MFi
+> authentication → BT→WiFi handover → AirPlay/RTSP on port 5000 — is a **separate layer** from
+> the USB host protocol described in this guide. The host app never participates in it. It is
+> documented in `session_examples.md` § *Wireless CarPlay Pairing — iPhone↔Adapter Handshake*
+> and in `02_Protocol_Reference/carplay_handshake.md`.
+
 ### BoxSettings JSON (Binary Verified Jan 2026)
 
 **⚠️ SECURITY NOTE:** The `wifiName`, `btName`, and `oemIconLabel` fields are passed to shell commands via `popen()` without sanitization. This enables command injection - any shell command can be executed as root by including shell metacharacters in these fields. See `03_Security_Analysis/vulnerabilities.md` for details.
@@ -523,22 +573,96 @@ fun sendBoxSettings() {
 }
 ```
 
+#### BoxSettings field → riddle.conf mapping (29-key table @ `0x93f90`)
+
+`BoxSettings` (USB type `0x19`, JSON body) is parsed by `ARMadb-driver` `FUN_00016c20`. The
+generic path `FUN_0001658c` walks a **29-entry field→key table at `0x93f90`**: each JSON field is
+mapped to a `riddle.conf` key (string → `SetBoxConfigStr`, number → `SetBoxConfig`).
+
+| # | JSON field | riddle.conf key | Capability effect |
+|---|------------|-----------------|-------------------|
+| 0 | `btName` | `CustomBluetoothName` | BT name (⚠ popen cmd-injection) |
+| 1 | `wifiName` | `CustomWifiName` | WiFi SSID (⚠ cmd-injection) |
+| 2 | `fps` | `CustomFrameRate` | → `Open` fps field |
+| 3 | `gps` | `HudGPSSwitch` | GPS/dashboard enable |
+| 4 | `lang` | `BoxConfig_UI_Lang` | UI language |
+| 5 | `bgMode` | `BackgroundMode` | connection-UI visibility |
+| 6 | `syncMode` | `iAP2TransMode` | iAP2 framing mode |
+| 7 | `startDelay` | `BoxConfig_DelayStart` | USB init delay |
+| 8 | `mediaDelay` | `MediaLatency` | audio buffer ms |
+| 9 | `mediaSound` | `MediaQuality` | 0=44.1 kHz, 1=48 kHz PCM |
+| 10 | `autoConn` | `NeedAutoConnect` | auto-reconnect |
+| 11 | `androidWorkMode` | `AndroidWorkMode` | also `fwrite /etc/android_work_mode` (0..5) |
+| 12 | `drivePosition` | `CarDrivePosition` | 0=LHD, 1=RHD |
+| 13 | `echoDelay` | `EchoLatency` | WebRTC AEC delay |
+| 14 | `androidAutoSizeW` | `AndroidAutoWidth` | AA video width |
+| 15 | `androidAutoSizeH` | `AndroidAutoHeight` | AA video height |
+| 16 | `screenPhysicalW` | `ScreenPhysicalW` | physical mm → CarPlay DPI |
+| 17 | `screenPhysicalH` | `ScreenPhysicalH` | physical mm → CarPlay DPI |
+| 18 | `brand` | `CarBrand` | OEM brand (special handler rewrites airplay.conf + logo) |
+| 19 | `ScreenDPI` | `ScreenDPI` | CarPlay render density |
+| 20 | `boxName` | `CustomBoxName` | device display name |
+| 21 | `WiFiChannel` | `WiFiChannel` | adapter AP channel (→ `0x5703 WifiConfigInfo`) |
+| 22 | `UseBTPhone` | `UseBTPhone` | route calls via BT-HFP |
+| 23 | `HiCarConnectMode` | `HiCarConnectMode` | HiCar mode |
+| 24 | `GNSSCapability` | `GNSSCapability` | GPS capability advertised |
+| 25 | `AutoResetUSB` | `AutoResetUSB` | USB reset on disconnect |
+| 26 | `DashboardInfo` | `DashboardInfo` | cluster/dashboard capability bitmask |
+| 27 | `DayNightMode` | `DayNightMode` | day/night mode |
+| 28 | `DockPosition` | `DuckPosition` (fw typo) | copies `HU_SCREEN_INFO` → `HU_VIEWAREA_INFO` |
+
+#### BoxSettings special handlers (NOT stored in riddle.conf)
+
+Some JSON fields are intercepted **before** the table above and are **not** written to
+`riddle.conf` — they act directly on the system clock or shared-memory geometry/volume structs:
+
+| JSON field | Target | Mechanism |
+|------------|--------|-----------|
+| `syncTime` | system clock | `settimeofday(val + 28800)` — hardcoded UTC+8 |
+| `mediaVol`/`callVol`/`speechVol`/`ringVol`/`navVol`/`otherVol` | `HU_AUDIOVOLUME_INFO[0..5]` | shared memory |
+| `naviScreenInfo{width,height,fps}` | `HU_NAVISCREEN_INFO` (24 B) | shared memory |
+| `naviScreenInfo.safearea` | `HU_NAVISCREEN_SAFEAREA_INFO` (20 B) + `HU_NAVISCREEN_VIEWAREA_INFO` (24 B) | shared memory |
+
+> **There is no BoxSettings field for the main-screen SafeArea.** `HU_SAFEAREA_INFO` is only
+> settable via `SendFile` (0x99) or SSH — see § *HU_\* Geometry Structs* and *Advanced File
+> Operations*.
+
 ### Open Message
+
+The `Open` (USB type `0x01`) payload is a fixed **28-byte body — 7 × uint32 little-endian**
+(verified from the 2026-05-21 capture and `ARMadb-driver` binary RE):
+
+| Offset | Field | uint32-LE | Notes |
+|--------|-------|-----------|-------|
+| 0x00 | `width` | display width | e.g. 2400 |
+| 0x04 | `height` | display height | e.g. 960 |
+| 0x08 | `fps` | frame rate | sourced from `riddleBoxCfg CustomFrameRate` |
+| 0x0C | `format` | video format ID | `1` = basic IDR, `5` = full H.264 / aggressive IDR |
+| 0x10 | `packetMax` | max packet size | e.g. `0xC000` |
+| 0x14 | `boxVersion` | protocol version | `2` |
+| 0x18 | `phoneMode` | iPhone work mode | `2` = CarPlay |
 
 ```kotlin
 fun sendOpen() {
-    val payload = ByteBuffer.allocate(28)
-        .putInt(displayWidth)    // e.g., 2400
-        .putInt(displayHeight)   // e.g., 960
-        .putInt(fps)             // e.g., 60
-        .putInt(5)               // format=5 for full H.264
-        .putInt(49152)           // packetMax
-        .putInt(2)               // boxVersion
-        .putInt(2)               // phoneMode
+    val payload = ByteBuffer.allocate(28).order(ByteOrder.LITTLE_ENDIAN)
+        .putInt(displayWidth)    // 0x00 width  — e.g., 2400
+        .putInt(displayHeight)   // 0x04 height — e.g., 960
+        .putInt(fps)             // 0x08 fps    — from riddleBoxCfg CustomFrameRate
+        .putInt(5)               // 0x0C format — 1=basic IDR, 5=full H.264 aggressive IDR
+        .putInt(49152)           // 0x10 packetMax
+        .putInt(2)               // 0x14 boxVersion
+        .putInt(2)               // 0x18 phoneMode — 2=CarPlay
 
     send(Open: 0x01, payload)
 }
 ```
+
+**Handler & side effect (`ARMadb-driver`):** `Open` is handled by `ProceessCmdOpen`
+(`fcn.00021cb0`). The handler **compares the `Open` `width`/`height` to the stored
+`HU_VIEWAREA_INFO`**; if they differ it **auto-rewrites `HU_VIEWAREA_INFO` full-screen** to the
+new dimensions. It does **not** touch `HU_SAFEAREA_INFO`. It then broadcasts the *phone's*
+resolution back to the host as USB type `0x1E`. The `Open` message is **re-sent every session**
+(it is not persistent).
 
 ### Android Auto Mode (CRITICAL)
 
@@ -575,6 +699,24 @@ fun enableAndroidAutoMode() {
 - If your host application is compromised, an attacker could overwrite system files
 
 **Secure Implementation Note:** If accepting user-provided paths, validate them thoroughly before passing to SendFile.
+
+#### Capability-Relevant SendFile Targets
+
+Several head-unit capabilities are set by writing specific files via `SendFile` (0x99). The
+firmware stages each upload through `/tmp/uploadFileTmp` before moving it to the target path.
+
+| Target | Type | Purpose |
+|--------|------|---------|
+| `/tmp/screen_dpi` | flat file | CarPlay render density |
+| `/tmp/screen_fps` | flat file | frame rate hint |
+| `/tmp/screen_size` | flat file | display size |
+| `/tmp/night_mode` | flat file | day/night mode |
+| `/tmp/hand_drive_mode` | flat file | LHD/RHD drive position |
+| `/tmp/charge_mode` | flat file | USB charge speed (see § *Charge Mode Control*) |
+| `/tmp/carplay_mode` | flat file | CarPlay mode flag |
+| `/tmp/iphone_work_mode` | flat file | iPhone work mode |
+| `/etc/android_work_mode` | flat file (persistent) | Android Auto enable (see § *Android Auto Mode*) |
+| `/etc/RiddleBoxData/HU_*` | binary structs | display geometry — `HU_SCREEN_INFO`, `HU_VIEWAREA_INFO`, `HU_SAFEAREA_INFO`, etc. (see § *HU_\* Geometry Structs*) |
 
 #### Writable Paths (Live Verified Jan 2026)
 
@@ -635,21 +777,70 @@ sendFile("/tmp/hwfs.tar.gz", createTarGz(files))
 
 See `03_Security_Analysis/vulnerabilities.md` for complete security implications.
 
+### HU_* Geometry Structs (/etc/RiddleBoxData/)
+
+The adapter stores head-unit display geometry as binary structs under `/etc/RiddleBoxData/`.
+All fields are **uint32 little-endian**. `AppleCarPlay` reads these at session init to build the
+AirPlay `viewAreas` / `displayInfo` descriptor sent to the iPhone.
+
+| Struct | Size | Layout (uint32-LE) |
+|--------|------|--------------------|
+| `HU_SCREEN_INFO` | 24 B | `[width, height, 0, 0, fps, dpi]` |
+| `HU_VIEWAREA_INFO` | 24 B | `[width, height, width, height, originX, originY]` |
+| `HU_SAFEAREA_INFO` | 20 B | `[width, height, originX, originY, drawUIOutsideSafeArea]` |
+
+- `HU_VIEWAREA_INFO` is the file `AppleCarPlay._CopyDisplayDescriptions` reads for
+  `viewAreas.widthPixels` / `heightPixels`.
+- `drawUIOutsideSafeArea = 0` → **hard crop** (UI black outside the SafeArea);
+  `= 1` → **wallpaper fills the full ViewArea**, interactive UI stays inside the SafeArea.
+
+**Config flow:**
+
+```
+host app → ARMadb-driver → /etc/riddle.conf + /etc/RiddleBoxData/HU_*
+                                  │  (MiddleMan IPC)
+                                  ▼
+                    AppleCarPlay / ARMiPhoneIAP2 → iPhone
+```
+
+`HU_VIEWAREA_INFO` is auto-rewritten by `ProceessCmdOpen` from the `Open` (0x01) message;
+`HU_SAFEAREA_INFO` has **no** BoxSettings field and must be written via `SendFile` (0x99) or SSH.
+
 ### Navigation Video Setup (iOS 13+)
 
 Include `naviScreenInfo` in BoxSettings to activate navigation video (type 0x2C). `AdvancedFeatures=1` is NOT required when `naviScreenInfo` is provided. See `02_Protocol_Reference/video_protocol.md` for complete firmware analysis of the navigation video activation path.
 
 **Note:** Only include `naviScreenInfo` when your host app handles NaviVideoData (Type 0x2C). This causes a second H.264 video stream that increases USB bandwidth and processing load.
 
-1. **Optionally handle Command 508**:
+1. **Handle Command 508 — three-step handshake** (discovered 2026-05-28 via live RE; see `02_Protocol_Reference/video_protocol.md` "Handshake Sequence" for the wire diagram):
+
    ```kotlin
-   // When receiving Command 508 from adapter — echo it back (recommended precaution)
-   // Testing was INCONCLUSIVE on whether this is strictly required.
-   // The pi-carplay reference implementation does echo 508 back.
+   // (a) Step 1 — proactive send.
+   //     Host kicks the handshake ~2 s after PLUGGED for CarPlay. Wireless CarPlay
+   //     sessions especially need this because the adapter never sends 508 on its own —
+   //     it sends only 506 (audio nav focus). Without this kick, _AltScreenSetup never
+   //     starts even when all three documented gates clear (persistent unlock file +
+   //     naviScreenInfo BoxSettings + features=naviScreen in boxInfo).
+   onPlugged { phoneType ->
+       if (phoneType.isCarPlay && naviScreenForwardingEnabled) {
+           launch {
+               delay(2000)
+               send(Command(value = 508))   // REQUEST_NAVI_SCREEN_FOCUS, step 1
+           }
+       }
+   }
+
+   // (b) Step 3 — echo the adapter's step-2 reply.
+   //     The adapter replies with Command(508) shortly after step 1. Echo it back to
+   //     confirm; the adapter then completes _AltScreenSetup and starts emitting 0x2C.
+   //     Repeated 508s are idempotent — this also covers wired CarPlay where the
+   //     adapter has been observed to initiate at step 2 on its own (echo-only pattern).
    if (commandId == 508) {
-       send(Command: 0x08, payload = 508)
+       send(Command(value = 508))   // step 3 (or echo-on-receive for wired)
    }
    ```
+
+   Live-verified 2026-05-28 on carlink_native + CPC200-CCPA firmware 2025.10.15.1127 (wireless CarPlay).
 
 2. **Handle NaviVideoData (Type 0x2C)**:
    ```kotlin
@@ -1063,9 +1254,179 @@ See `02_Protocol_Reference/usb_protocol.md` > SendFile for GPIO charge mode beha
 
 ---
 
+## AltVideo → Cluster Display (USB 0x2C)
+
+**Verified end-to-end on AAOS emulator, 2026-05-28.** Host app + a system-priv companion app on the cluster sandbox can render the iPhone's CarPlay navigation video onto the AAOS instrument cluster, parallel to the main 0x06 video feed on the IHU.
+
+### Two-app split
+
+The integration uses two processes on the head unit, not one:
+
+```
+                                CPC200-CCPA adapter
+                                        │ USB
+                                        ▼
+                        ┌──────────────────────────────────┐
+                        │ zeno.carlink (host app, 3P APK)  │
+                        │  • Owns USB                      │
+                        │  • Sends naviScreenInfo +        │
+                        │    safearea in BoxSettings (0x19)│
+                        │  • Demuxes 0x06 → main video     │
+                        │  • Demuxes 0x2C → NaviVideo      │
+                        │      Forwarder                   │
+                        │        ↓                         │
+                        │      AIDL Service                │
+                        │      (NaviVideoSourceService,    │
+                        │       sig|priv permission)       │
+                        └──────────────────────────────────┘
+                                        │ Binder
+                                        ▼
+                  ┌────────────────────────────────────────┐
+                  │ ClusterHomeDisplay (priv-app on        │
+                  │  /system/priv-app/, cluster sandbox)   │
+                  │  • Binds NaviVideoSourceService        │
+                  │  • Registers INaviVideoSink            │
+                  │  • Receives Annex-B NAL access units   │
+                  │  • MediaCodec decode → SurfaceView     │
+                  │    at native 1:1 (1920×620 on emu)     │
+                  └────────────────────────────────────────┘
+                                        │
+                                        ▼
+                          AAOS cluster VirtualDisplay
+                       (display 3, ClusterOsDouble-VD)
+```
+
+Why split: the host app owns USB but cannot reach the cluster sandbox without platform-signed privileges; the cluster app is a priv-app with `CAR_INSTRUMENT_CLUSTER_CONTROL` but cannot touch USB. Bridging them with an AIDL `Service` + a `Surface`-or-`byte[]` IPC keeps each app at minimum privilege.
+
+### Wire format on AIDL
+
+Producer sends, per access unit, **raw Annex-B H.264** (start-code prefixed) with NO USB or video-header bytes — those have already been stripped by the host. The consumer receives the same payload the iPhone emitted, just with the 36 B carrier removed.
+
+```aidl
+oneway interface INaviVideoSink {
+    void onStreamConfigured(int width, int height, int fps);
+    void onFrame(in byte[] h264AnnexB, long ptsUs, boolean isKeyFrame);
+    void onStreamEnded();
+}
+
+interface INaviVideoSource {
+    void registerSink(INaviVideoSink sink);
+    void unregisterSink(INaviVideoSink sink);
+    boolean isStreamActive();
+}
+```
+
+Bandwidth at 1920×620@30 nav-UI content is ~3–6 Mbps → ~12–25 KB per access unit average. Binder `oneway` calls handle this comfortably; the default 1 MB transaction buffer dwarfs per-frame size, and the consumer's binder threadpool drains at rate.
+
+### Late-bind keyframe replay (critical)
+
+The iPhone emits SPS+PPS+IDR **once at session start**, then refreshes every ~2–7 seconds. A consumer that binds *after* the initial keyframe has been broadcast will receive only P-frames and never lock its decoder.
+
+The producer MUST cache the last keyframe access unit and replay it to any sink that registers mid-session:
+
+```kotlin
+private var cachedKeyframe: Pair<ByteArray, Long>? = null
+
+fun onUsbFrame(payload: ByteArray, ptsUs: Long, isKey: Boolean) {
+    if (isKey) cachedKeyframe = payload to ptsUs
+    broadcastToSinks { it.onFrame(payload, ptsUs, isKey) }
+}
+
+fun registerSink(sink: INaviVideoSink) {
+    sinks.register(sink)
+    if (streamActive) {
+        sink.onStreamConfigured(lastW, lastH, lastFps)
+        cachedKeyframe?.let { (b, pts) -> sink.onFrame(b, pts, true) }
+    }
+}
+```
+
+Without this, a cluster app that boots, gets preempted, or rebinds after a producer reinstall waits 2–7 seconds with a black overlay before its decoder configures.
+
+### Keyframe detection
+
+The producer must scan the Annex-B payload for **any** NAL of type 5 (IDR), not just look at the first NAL. A typical CarPlay keyframe access unit is `[SPS (7), PPS (8), IDR (5)]` concatenated — first NAL is SPS, not IDR. A first-NAL-only check returns false negatives 100% of the time.
+
+```kotlin
+fun annexBContainsIdr(buf: ByteArray): Boolean {
+    var i = 0
+    while (i < buf.size - 4) {
+        if (buf[i] == 0.toByte() && buf[i+1] == 0.toByte()
+            && buf[i+2] == 0.toByte() && buf[i+3] == 1.toByte()
+            && i + 4 < buf.size) {
+            if ((buf[i + 4].toInt() and 0x1F) == 5) return true
+            i += 4
+        } else i++
+    }
+    return false
+}
+```
+
+### Consumer MediaCodec configure
+
+On the cluster side, the consumer extracts SPS (NAL type 7) and PPS (NAL type 8) from the first keyframe access unit and supplies them as `csd-0` / `csd-1` in the `MediaFormat`. Some MediaCodec implementations (notably the AAOS emulator's software AVC decoder) reject inband CSD; explicit `csd-0` / `csd-1` is the spec-compliant path.
+
+After configure, the decoder feeds the same keyframe access unit as a regular input buffer with `BUFFER_FLAG_KEY_FRAME`, then continues with subsequent P-frames. Output renders directly to a `SurfaceView`-provided `Surface` — zero per-frame IPC, zero shared-memory ceremony.
+
+### Pixel mapping (no distortion)
+
+For 1:1 mapping with no SurfaceFlinger scaling:
+1. Producer announces `naviScreenInfo {width, height, fps}` matching the **usable** cluster sandbox (not the physical panel — on the AAOS emulator that's 1920×620, not 1920×720).
+2. Consumer's SurfaceView is sized to match the same dimensions: root-level `FrameLayout` with `match_parent`, **no parent padding**, **no insets**.
+3. Consumer calls `holder.setFixedSize(streamW, streamH)` so the surface buffer ties to stream geometry.
+4. Result: source → MediaCodec output → surface buffer → composited pixels are all the same dimensions. SurfaceFlinger does a 1:1 blit.
+
+If any link in that chain has different dimensions (e.g., the SurfaceView is inside a parent with padding), SurfaceFlinger rescales — typically asymmetrically — and the user sees stretched text and oval circles. Verified failure mode: a 1888×572 View receiving a 1920×620 stream produces ~5.5% horizontal stretch.
+
+### SafeArea
+
+The host advertises a safe rect inside the announced screen geometry; the iPhone keeps interactive CarPlay UI (turn cards, lane guidance, speed-limit chips, search affordances) inside it. Map backgrounds may still extend beyond. See `02_Protocol_Reference/video_protocol.md` §SafeArea for the JSON shape and firmware path.
+
+```json
+"naviScreenInfo": {
+  "width": 1920, "height": 620, "fps": 30,
+  "safearea": {
+    "x": 100, "y": 0, "width": 1720, "height": 620, "outside": 0
+  }
+}
+```
+
+100 px horizontal inset accounts for the AAOS emulator's gauge arcs on left/right; zero vertical inset because the VirtualDisplay has no top/bottom obstructions (ClusterOsDouble's gauge strip sits below the VirtualDisplay, in the 100 px of physical-panel that's not part of the sandbox).
+
+### Lifecycle resilience
+
+Cross-process bindings can die from multiple angles. The consumer must handle:
+
+| Event | Producer side | Consumer side |
+|---|---|---|
+| Cluster activity preempted by Templates Host | unchanged | existing keep-alive re-foregrounds |
+| Producer process killed / reinstalled | sinks list cleared | both `onServiceDisconnected` and `linkToDeath` fire — schedule rebind with backoff |
+| USB disconnect / CarPlay session end | broadcast `onStreamEnded` | hide SurfaceView, release decoder |
+| Resolution change mid-session | rebroadcast `onStreamConfigured` | `setFixedSize` updates buffer; next IDR reconfigures decoder |
+
+A simple `1s → 2s → 4s → ... → 30s` exponential backoff on the consumer's rebind path covers all transient outages without per-second polling.
+
+### What the user sees
+
+- Cluster default state: 60/40 cards (nav left, media right) rendered by the cluster app.
+- iPhone connects + CarPlay session starts: nothing changes until the iPhone emits a 0x2C frame.
+- First 0x2C frame: cluster overlay flips visible (~50 ms), shows iPhone's CarPlay nav UI at native 1:1, identical aspect to what CarPlay would render on a 1920×620 panel.
+- CarPlay session ends / iPhone disconnects: overlay flips back to hidden, cards return.
+
+Visual regression checklist: turn cards land inside the safe area, road labels are round (no oval stretch), speed limit chips are square (not rectangular). All three indicate a clean pipeline.
+
+### Reference implementation
+
+Working implementation in `documents/reference/android_studio_emulator/ClusterHomeDisplay/` (consumer side) and `app/src/main/kotlin/com/carlink/ipc/` in carlink_native (producer side). The `INTEGRATION_CARLINK_NATIVE.md` document inside the cluster app's directory specifies the producer-side contract in full.
+
+The two-app split is specific to AAOS: the cluster sandbox is platform-walled, so a 3P APK can talk to USB but not to the cluster display; a priv-app can render to the cluster but cannot touch USB. The AIDL `Service` + per-frame `oneway` `byte[]` bridge ties the two together at minimum privilege per app.
+
+---
+
 ## References
 
 - Source: `GM_research/cpc200_research/docs/implementation/`
 - Source: `carlink_native/documents/reference/Firmware/`
 - Protocol reference: See `02_Protocol_Reference/` in this documentation
 - **Session examples: See `session_examples.md` for real captured CarPlay/Android Auto packet sequences**
+- **AltVideo cluster integration:** `documents/reference/android_studio_emulator/ClusterHomeDisplay/` (consumer side, AIDL, MediaCodec) + `INTEGRATION_CARLINK_NATIVE.md` (producer-side spec)
