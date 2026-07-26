@@ -616,3 +616,93 @@
    - Roundabout icons unchanged in correctness (same first-wins key); they benefit most as the heaviest renders move off the read thread.
    - Graphics ops were already off-main-thread; single worker = zero compose concurrency, all Path/Paint function-local. Builds clean, installed versionCode 139.
    - Affected: ComposedIconStore.kt (parse-inline + background worker + dedup + supersede), CarlinkManager.kt (call-site comment + log text).
+
+[140] :: Android Auto portrait + any-AR support — two-way aspect-fit fills every display at native AR, no crop or stretch.
+   - Root: AA tier table was landscape-only; portrait or narrow displays collapsed to a wrong 16:9 tier, cropping content.
+   - Ported AutoKit C0797c0.m6106c two-way fit (macOS client reference): rendered content AR always equals display AR.
+   - The non-binding tier edge shrinks; phone bakes black bars on that axis, host oversizes/clips to remove them.
+   - MessageSerializer.kt: orientation-aware tiers (portrait 480x800, 720x1280, 1080x1920) plus two-way emit binding the constrained edge.
+   - CarlinkManager.kt getAaCropParams now axis-aware: AaCropParams gains contentWidth/cropLeft for left/right bars on tall displays.
+   - MainScreen.kt oversizes width or height by crop axis; touch normalization adds a symmetric cropLeftX offset.
+   - Landscape and CarPlay unchanged: displayAR>=tierAR path identical; CarPlay still uses serializeOpen, untouched.
+   - Live AAOS emulator 1440x1920 portrait with phone: was tier=1280x720 aaSize=1280x720 crop=null (stretched).
+   - Now tier=1080x1920 aaSize=1080x1440 cropTop=240; surface oversized 1440x2560, clipped to fill display at correct AR.
+   - Horizontal-crop (cropLeft) path implemented but not yet hardware-validated; needs a portrait display taller than 9:16.
+   - Affected: MessageSerializer.kt, CarlinkManager.kt, MainScreen.kt.
+
+[141] :: Cluster maneuver mapping — WITH_ANGLE roundabouts, VCU platform-gate for dead bitmap work, firmware-verified CT5 cluster pipeline.
+   - ManeuverMapper roundabouts now use TYPE_ROUNDABOUT_ENTER_AND_EXIT_*_WITH_ANGLE + setRoundaboutExitAngle from iAP2 0x000b / AA NaviTurnAngle.
+   - iAP2 driver-relative exit angle converted to androidx swept-angle: CCW=(180-a)mod360, CW=(180+a)mod360, 0 maps to 360.
+   - PlatformDetector.isVcuCluster() detects VCU (device burmese / Build.ID prefix VCU); best-effort, untested, no VCUNH1 hardware.
+   - On VCU, ComposedIconStore bitmap compose and the AA cluster-icon shim are skipped; both are masked there anyway.
+   - Firmware-verified (4-agent OS-image sweep): CT5 cluster rendered by QNX HMIC (Altia GMModel), Android blind to pixels.
+   - Handoff is enum-only over inter-VM Automotive Ethernet (NFSA/FSA); no bitmap/URI consumer exists on the CT5 cluster path.
+   - CT5 Altia atlas lacks directional roundabout glyphs, so WITH_ANGLE has no visible CT5 effect; kept for gminfo37-neutral correctness.
+   - Non-roundabout maneuvers already render correct GM glyphs; rich-iAP2 cluster improvement is gminfo3.7-only.
+   - gminfo3.7 behavior unchanged; assembleSideloadDebug and ktlintCheck pass.
+   - Affected: ManeuverMapper.kt, NavigationStateManager.kt, TripBuilder.kt, PlatformDetector.kt, ComposedIconStore.kt, CarlinkManager.kt.
+
+[142] :: Video staging buffer fix — AA/CarPlay pixelation from oversized-frame drops.
+   - STAGED_FRAME_CAPACITY raised 512KB -> 2MB. Affected: H264Renderer.java.
+   - Root cause: staging slot (512KB) too small for legit 1080p map frames.
+   - Frames hit 690-887KB, rejected by the feedDirect oversized guard.
+   - That drop breaks the H.264 reference chain, so the picture corrupts.
+   - AA sends ~1 IDR per session, so a dropped frame stays pixelated.
+   - Recovery: a lucky natural IDR, or manual navigate-away/back (resumeVideo teardown + FRAME).
+   - Diagnosed via live emulator logcat: oversized-drop count correlated 1:1 with pixelation.
+   - oversized:6/1 -> pixelated; oversized:0 -> clean; self-cleared when a fitting natural IDR arrived.
+   - Fix covers AA 1080p (~1.5MB) and CarPlay up to 2400x960 (~1.7MB).
+   - KNOWN LIMIT: 2MB does NOT cover CarPlay 4K (~3-6MB frames).
+   - Frame size = resolution x content complexity; heavy 4K motion still exceeds 2MB.
+   - Complete fix (future): resolution-derived capacity from negotiated WxH at initCodec.
+   - Plus reactive keyframe on oversized drop, instead of waiting on luck.
+   - Envelope confirmed via AA APK 16.9.666314 decompile plus prior ADB trace.
+   - H.264-only (CPC200 adapter hard limit); AA capped at 1080p; CarPlay up to 4K.
+   - Gearhead VIDEO_1440x2560 / 3840x2160 enums are stubs; never drive the encoder.
+   - Tested AA 1080x1920 and CarPlay 3840x2160: 0 oversized, clean decode (Rx==Dec).
+   - NOT stress-validated: neither session crossed 512KB; peaks 318KB and 147KB.
+   - Emulator c2.goldfish software decoder kept up with 4K under light load.
+
+[143] :: Play AAOS compliance Attempt: add templates_host + ACCESS_SURFACE. Cluster Integration auto-on for debug emulator.
+   - Context: Google "Approved with Issues" a Closed-Beta vc140 — Automotive Support + App category not permitted.
+   - Manifest: added uses-feature android.software.car.templates_host required=true; cluster CarAppService depends on Templates Host.
+   - Manifest: added uses-permission androidx.car.app.ACCESS_SURFACE; host provisions a render surface to the CarAppService.
+   - Manifest: usb.host required=false — gminfo37 lacks the feature flag; required=true filtered the truck off AAOS track.
+   - Verified on emulator: host binds CarlinkClusterService, provisions virtual display, ContentProvider authority still claimed.
+   - Not added: APP_MAPS — cluster bound on vc139 and vc142 without it. Carlink projects phone maps.
+   - appCategory="audio" already present; notice example was false. To appeal, not fix.
+   - Kept by design: MainActivity stays distractionOptimized (projection surface); CarAppActivity stays hidden non-launcher binding stub.
+   - AdapterConfigPreference: Cluster Integration defaults ON when BuildConfig.DEBUG and isAaosEmulator(); production and hardware stay OFF.
+   - Clean install verified: component auto-enables, host binds, no manual toggle needed.
+   - Affected: AndroidManifest.xml, ui/settings/AdapterConfigPreference.kt
+
+[144] :: SYSTEM_UI_VISIBLE inset double-count fix + projection-size divergence WARN. Emulator immersive default removed.
+   - Root cause: applyDisplayMode SYSTEM_UI_VISIBLE set decorFitsSystemWindows(true); Compose windowInsetsPadding subtracted the same system bars again.
+   - Window pre-clipped to 788, Compose pad then gave 616; codec stayed 788 from stable WindowMetrics.
+   - On-screen surface 172px (top 76 + bottom 96) shorter than decoded frame; bottom content clipped.
+   - AA letterbox-cushioned the gap; CarPlay fillMaxSize would squish directly (unverified, no CarPlay 616 repro reached).
+   - Fix: MainActivity.kt decorFitsSystemWindows(window, false) for SYSTEM_UI_VISIBLE; only Compose subtracts insets now.
+   - Trigger intermittent: display-off/on (lock/unlock) on a soaked emulator; plain app toggles never armed it.
+   - Once latched, persists across activity restarts until process death; cold boot and reboot clear it.
+   - NOT deterministically validated: post-reboot the bug stops arming; fix rests on mechanism, not repeatable repro.
+   - Added CarlinkManager.kt post-debounce WARN: fires when stabilized surface != pre-computed codec resolution.
+   - Gated past SURFACE_DEBOUNCE so startup/relayout transients are ignored; only settled divergence logs.
+   - Verified fixed build: cold start, lock/unlock, AA oversize, CarPlay render all correct, zero WARNs.
+   - Immersive mode structurally immune (no windowInsetsPadding); codec=container=960, AA tested 5/5 clean post-reboot.
+   - PlatformDetector.requiresImmersiveDefaults() dropped isAaosEmulator(); AAOS emulator no longer defaults to FULLSCREEN_IMMERSIVE.
+   - Side effect: OEM Exit icon now visible on emulator; gminfo37 immersive + hidden-icon defaults unchanged.
+   - Corrected false comments: currentWindowMetrics.bounds is full 2400x960, not post-clip 788; decorFits=true not required for surface geometry.
+   - Affected: MainActivity.kt, CarlinkManager.kt, PlatformDetector.kt, DisplayModePreference.kt, AdapterConfigPreference.kt
+
+[145] :: CPU: de-spin H264 feeder (park/unpark) and pace the audio playback loop. Verified on live gminfo37.
+   - Video: H264Renderer feederLoop parkNanos(1ms) busy-spin replaced with blocking park(); feedDirect unparks feeder after each stagingOffer.
+   - stopStaging already unparks for shutdown; unpark(null) is a no-op, so the start/stop window stays safe.
+   - park() consumes a permit, so an enqueue racing the park returns immediately — no frame lost.
+   - Measured: H264-Feeder idle-spin removed; 0% idle, ~1.5-3% at full 60fps (feed work only), was ~6%.
+   - Audio: DualStreamAudioManager playback loop now sleeps 5ms every pass, not only when fully idle.
+   - Per-pass capacity ~100ms/slot into 750ms ring plus AudioTrack buffer; 5ms cadence cannot underfeed at 1x.
+   - Removes the active-playback busy-spin; didWork is now vestigial (assigned, unread) — harmless, compiler warning only.
+   - Both threads are downstream consumers; no change to USB read, heartbeat, or session paths.
+   - Live wired CarPlay: Urun:0 across windows, Resets:0, zero frame drops, no regressions.
+   - Wireless churned every ~11s (adapter USB-IN went silent); wired stable — Wi-Fi link, not these changes.
+   - Affected: video/H264Renderer.java, audio/DualStreamAudioManager.kt

@@ -123,6 +123,18 @@ class CarlinkManager(
         // override pipeline. Validation pathway: PNGs written by ManeuverIconDebugDumper
         // continue regardless of this flag.
         com.carlink.navigation.compose.ComposedIconStore.setEnabled(true)
+
+        // VCU/VCUNH1 (CT5, AAOS 14) enum-only cluster gate. There the cluster is a separate QNX
+        // safety-domain VM that renders a native Altia sprite from the Maneuver enum and MASKS the
+        // app bitmap/URI (see documents/reference/gminfo/projection/cluster_maneuver_mapping.md §0/§4).
+        // The roundabout WITH_ANGLE refinement (ManeuverMapper) still feeds that enum, but the
+        // per-maneuver bitmap compose and the AA-bitmap shim are dead work there — skip both.
+        // BEST-EFFORT / UNTESTED detection (no VCUNH1 hardware); harmless elsewhere (default off).
+        val clusterIsEnumOnly = PlatformDetector.detect(context).isVcuCluster()
+        if (clusterIsEnumOnly) {
+            com.carlink.navigation.compose.ComposedIconStore.setBitmapComposeEnabled(false)
+            NavigationStateManager.setClusterEnumOnly(true)
+        }
     }
 
     // Config can be updated when actual surface dimensions are known
@@ -278,7 +290,9 @@ class CarlinkManager(
     data class AaCropParams(
         val tierWidth: Int,
         val tierHeight: Int,
+        val contentWidth: Int,
         val contentHeight: Int,
+        val cropLeft: Int,
         val cropTop: Int,
     )
 
@@ -625,6 +639,25 @@ class CarlinkManager(
                             "${pendingSurfaceWidth}x$pendingSurfaceHeight - updating codec",
                         tag = Logger.Tags.VIDEO,
                     )
+
+                    // Persistent-divergence detector: the codec decodes at the pre-computed
+                    // config (stable WindowMetrics, see L584-586); the surface dims above are the
+                    // live UI area. A mismatch at first-init is an expected startup transient that
+                    // the debounce coalesces away — but if it SURVIVES the debounce and lands here,
+                    // the on-screen area genuinely disagrees with the projection area (visual
+                    // scale/crop mismatch), not a layout artifact. Skip when the user pinned a
+                    // custom resolution (config intentionally != surface then).
+                    if (!config.userSelectedResolution &&
+                        (pendingSurfaceWidth != config.width || pendingSurfaceHeight != config.height)
+                    ) {
+                        logWarn(
+                            "[RES] Surface stabilized at ${pendingSurfaceWidth}x$pendingSurfaceHeight " +
+                                "but codec is ${config.width}x${config.height} — persistent divergence " +
+                                "(UI area != projection area, " +
+                                "Δ=${config.width - pendingSurfaceWidth}x${config.height - pendingSurfaceHeight})",
+                            tag = Logger.Tags.VIDEO,
+                        )
+                    }
 
                     this@CarlinkManager.callback = finalCallback
                     this@CarlinkManager.videoSurface = finalSurface
@@ -1409,16 +1442,32 @@ class CarlinkManager(
         if (surfW <= 0 || surfH <= 0) return null
 
         val (tierWidth, tierHeight) =
-            when {
-                surfW >= 1920 -> Pair(1920, 1080)
-                surfW >= 1280 -> Pair(1280, 720)
-                else -> Pair(800, 480)
+            if (surfH > surfW) {
+                when {
+                    surfW >= 1080 -> Pair(1080, 1920)
+                    surfW >= 720 -> Pair(720, 1280)
+                    else -> Pair(480, 800)
+                }
+            } else {
+                when {
+                    surfW >= 1920 -> Pair(1920, 1080)
+                    surfW >= 1280 -> Pair(1280, 720)
+                    else -> Pair(800, 480)
+                }
             }
         val displayAR = surfW.toFloat() / surfH.toFloat()
-        val contentHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
-        if (contentHeight >= tierHeight) return null // 16:9 or narrower — no crop needed
-        val cropTop = (tierHeight - contentHeight) / 2
-        return AaCropParams(tierWidth, tierHeight, contentHeight, cropTop)
+        val tierAR = tierWidth.toFloat() / tierHeight.toFloat()
+        // Two-way fit: baked bars sit on whichever tier axis the display does NOT bind.
+        // displayAR >= tierAR → bars top/bottom (crop vertically); else → bars left/right.
+        return if (displayAR >= tierAR) {
+            val contentHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
+            if (contentHeight >= tierHeight) return null // exact AR match — no crop
+            AaCropParams(tierWidth, tierHeight, tierWidth, contentHeight, 0, (tierHeight - contentHeight) / 2)
+        } else {
+            val contentWidth = ((tierHeight.toFloat() * displayAR).toInt() and 0xFFFE).coerceAtMost(tierWidth)
+            if (contentWidth >= tierWidth) return null // exact AR match — no crop
+            AaCropParams(tierWidth, tierHeight, contentWidth, tierHeight, (tierWidth - contentWidth) / 2, 0)
+        }
     }
 
     /**
