@@ -24,11 +24,7 @@ android {
         applicationId = ownerApplicationId
         minSdk = 29
         targetSdk = 36
-<<<<<<< HEAD
-        versionCode = 1
-=======
-        versionCode = 145
->>>>>>> upstream/main
+        versionCode = 146
         versionName = "1.0.0"
 
 //###############################################
